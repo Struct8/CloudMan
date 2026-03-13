@@ -1,4 +1,5 @@
 #!/bin/bash
+# EC2/Scripts/WordPressProfessional.sh
 # === Script de Configuração do WordPress em EC2 com EFS, RDS, ProxySQL e X-Ray ===
 # Versão: 3.2.0 (PHP 8.2 e WordPress Dinâmico)
 # - ADICIONADO: Variável de ambiente 'WP_VERSION' para controlar a versão do WordPress. Se vazia ou "latest", instala a mais recente.
