@@ -1,3 +1,4 @@
+# EC2/Scripts/FetchAndRunS3Script.sh
 # Usando caminho literal para evitar problemas com variáveis de shell
 echo "INFO: Ajustando permissões para /home/ec2-user/.env..."
 chmod 644 /home/ec2-user/.env
