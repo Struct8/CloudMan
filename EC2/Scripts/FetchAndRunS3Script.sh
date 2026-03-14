@@ -1,6 +1,7 @@
 # EC2/Scripts/FetchAndRunS3Script.sh
 
-# Apaga o semáforo do Cloud-Init. Assim ele acha que nunca rodou.
+# Apaga o semáforo do Cloud-Init. Assim ele acha que nunca rodou. 
+# Apenas para depuração
 rm -f /var/lib/cloud/instances/*/sem/config_scripts_user
 
 # Usando caminho literal para evitar problemas com variáveis de shell
