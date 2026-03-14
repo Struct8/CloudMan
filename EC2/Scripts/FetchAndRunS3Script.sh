@@ -1,4 +1,8 @@
 # EC2/Scripts/FetchAndRunS3Script.sh
+
+# Apaga o semáforo do Cloud-Init. Assim ele acha que nunca rodou.
+rm -f /var/lib/cloud/instances/*/sem/config_scripts_user
+
 # Usando caminho literal para evitar problemas com variáveis de shell
 echo "INFO: Ajustando permissões para /home/ec2-user/.env..."
 chmod 644 /home/ec2-user/.env
