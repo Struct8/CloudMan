@@ -15,9 +15,8 @@ Parameters:
     AllowedValues: ["true", "false"]
 
   S3BucketName:
-    Description: "Name of the S3 bucket (Required if CreateS3Bucket is true)."
+    Description: "Name of the S3 bucket (Required if CreateS3Bucket is true. Must be globally unique)."
     Type: String
-    Default: "none"
 
   # --- DYNAMODB CONFIGURATION ---
   CreateDynamoDBTable:
@@ -66,7 +65,8 @@ Resources:
       ClientIdList:
         - sts.amazonaws.com
       ThumbprintList:
-        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 6938fd4d98bab03faadb97b34396831e3780aea1 # Legacy thumbprint (still valid)
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd # New updated thumbprint
 
   # 2. S3 Bucket for Terraform State (Optional)
   TerraformStateBucket:
@@ -126,7 +126,11 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Federated: !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+              # Fixes Race Condition: Creates implicit dependency only if OIDC is created in the Stack
+              Federated: !If 
+                - ShouldCreateOIDC
+                - !Ref GithubOidc
+                - !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
             Action: "sts:AssumeRoleWithWebIdentity"
             Condition:
               StringLike:
