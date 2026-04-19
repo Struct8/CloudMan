@@ -1,54 +1,54 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Template para Backend do Terraform com OIDC GitHub Actions. Cria S3 e DynamoDB apenas se solicitado.
+Description: Template for Terraform Backend with OIDC GitHub Actions. Creates S3 and DynamoDB only if requested.
 
 Parameters:
   UserName:
-    Description: "Usuário que disparou a criação (Tag CloudmanUser)."
+    Description: "User who triggered the creation (Struct8User Tag)."
     Type: String
-    Default: "usuario-cloudman"
+    Default: "Struct8-user"
 
-  # --- CONFIGURAÇÃO S3 ---
+  # --- S3 CONFIGURATION ---
   CreateS3Bucket:
-    Description: "Deseja criar o bucket S3? (true/false)."
+    Description: "Do you want to create the S3 bucket? (true/false)."
     Type: String
     Default: "true"
     AllowedValues: ["true", "false"]
 
   S3BucketName:
-    Description: "Nome do bucket S3 (Obrigatório se CreateS3Bucket for true)."
+    Description: "Name of the S3 bucket (Required if CreateS3Bucket is true)."
     Type: String
     Default: "none"
 
-  # --- CONFIGURAÇÃO DYNAMODB ---
+  # --- DYNAMODB CONFIGURATION ---
   CreateDynamoDBTable:
-    Description: "Deseja criar a tabela DynamoDB para State Locking? (true/false)."
+    Description: "Do you want to create the DynamoDB table for State Locking? (true/false)."
     Type: String
     Default: "true"
     AllowedValues: ["true", "false"]
 
   DynamoDBTableName:
-    Description: "Nome da tabela DynamoDB."
+    Description: "Name of the DynamoDB table."
     Type: String
     Default: "terraform-state-lock"
 
-  # --- CONFIGURAÇÃO GITHUB & OIDC ---
+  # --- GITHUB & OIDC CONFIGURATION ---
   CreateOIDCProvider:
-    Description: "Cria o provedor OIDC se ele ainda não existir na conta (true/false)."
+    Description: "Creates the OIDC provider if it does not already exist in the account (true/false)."
     Type: String
     Default: "true"
     AllowedValues: ["true", "false"]
 
   IAMRoleName:
-    Description: "Nome da IAM Role para o GitHub Actions."
+    Description: "Name of the IAM Role for GitHub Actions."
     Type: String
     Default: "github-actions-terraform-role"
 
   GitHubOrg:
-    Description: "Organização/Usuário no GitHub."
+    Description: "GitHub Organization/User."
     Type: String
 
   GitHubRepo:
-    Description: "Repositório GitHub autorizado."
+    Description: "Authorized GitHub repository."
     Type: String
 
 Conditions:
@@ -57,7 +57,7 @@ Conditions:
   ShouldCreateOIDC: !Equals [ !Ref CreateOIDCProvider, "true" ]
 
 Resources:
-  # 1. Provedor OIDC (Opcional)
+  # 1. OIDC Provider (Optional)
   GithubOidc:
     Type: AWS::IAM::OIDCProvider
     Condition: ShouldCreateOIDC
@@ -68,7 +68,7 @@ Resources:
       ThumbprintList:
         - 6938fd4d98bab03faadb97b34396831e3780aea1
 
-  # 2. Bucket S3 para o Terraform State (Opcional)
+  # 2. S3 Bucket for Terraform State (Optional)
   TerraformStateBucket:
     Type: AWS::S3::Bucket
     Condition: ShouldCreateS3
@@ -88,12 +88,12 @@ Resources:
       Tags:
         - Key: Name
           Value: !Ref S3BucketName
-        - Key: CloudmanUser
+        - Key: Struct8User
           Value: !Ref UserName
         - Key: State
           Value: !Ref "AWS::StackName"
 
-  # 3. Tabela DynamoDB para State Locking (Opcional)
+  # 3. DynamoDB Table for State Locking (Optional)
   TerraformStateLockTable:
     Type: AWS::DynamoDB::Table
     Condition: ShouldCreateDynamoDB
@@ -109,12 +109,12 @@ Resources:
       Tags:
         - Key: Name
           Value: !Ref DynamoDBTableName
-        - Key: CloudmanUser
+        - Key: Struct8User
           Value: !Ref UserName
         - Key: State
           Value: !Ref "AWS::StackName"
 
-  # 4. IAM Role para o GitHub Actions (Sempre criada)
+  # 4. IAM Role for GitHub Actions (Always created)
   GitHubActionsRole:
     Type: AWS::IAM::Role
     Properties:
@@ -136,22 +136,22 @@ Resources:
       Tags:
         - Key: Name
           Value: !Ref IAMRoleName
-        - Key: CloudmanUser
+        - Key: Struct8User
           Value: !Ref UserName
         - Key: State
           Value: !Ref "AWS::StackName"
 
 Outputs:
   RoleArn:
-    Description: "ARN da Role para usar no GitHub Actions"
+    Description: "ARN of the Role to use in GitHub Actions"
     Value: !GetAtt GitHubActionsRole.Arn
   
   BucketName:
     Condition: ShouldCreateS3
-    Description: "Nome do Bucket S3 criado"
+    Description: "Name of the created S3 Bucket"
     Value: !Ref TerraformStateBucket
 
   DynamoDBTable:
     Condition: ShouldCreateDynamoDB
-    Description: "Nome da tabela DynamoDB criada"
+    Description: "Name of the created DynamoDB table"
     Value: !Ref TerraformStateLockTable
