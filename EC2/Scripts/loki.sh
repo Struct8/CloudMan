@@ -20,7 +20,7 @@ chmod +x /usr/local/bin/loki
 # Resgatar IP local para Configuração
 PRIVATE_IP=\$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
 
-# Gerar arquivo de configuração com S3 Backend
+# Gerar arquivo de configuração otimizado para os componentes do Cluster
 cat << EOF_CONF > /etc/loki/loki-config.yaml
 auth_enabled: false
 
@@ -35,10 +35,39 @@ common:
     s3:
       region: \$REGION
       bucketnames: \$AWS_S3_BUCKET_NAME_0
-  replication_factor: 1
+  replication_factor: 3
   ring:
     kvstore:
       store: memberlist
+
+# --- CONFIGURAÇÃO ESPECÍFICA DO DISTRIBUTOR ---
+distributor:
+  ring:
+    kvstore:
+      store: memberlist
+
+# --- CONFIGURAÇÃO ESPECÍFICA DO INGESTER ---
+ingester:
+  lifecycler:
+    ring:
+      kvstore:
+        store: memberlist
+      replication_factor: 3
+    final_sleep: 0s
+  chunk_idle_period: 1h
+  max_chunk_age: 1h
+  chunk_target_size: 1572864
+  chunk_retain_period: 30s
+
+# --- CONFIGURAÇÃO ESPECÍFICA DO QUERY FRONTEND ---
+query_frontend:
+  max_outstanding_per_tenant: 2048
+  compress_responses: true
+
+# --- CONFIGURAÇÃO ESPECÍFICA DO QUERIER ---
+querier:
+  query_timeout: 5m
+  max_concurrent: 8
 
 memberlist:
   bind_port: 7946
@@ -63,12 +92,12 @@ storage_config:
 EOF_CONF
 chown loki:loki /etc/loki/loki-config.yaml
 
-# Script que descobre os outros Lokis no Auto Scaling para formar o anel (cluster)
+# Script de descoberta dinâmica do Memberlist para os 3 nós
 cat << 'EOF_RUN' > /usr/local/bin/run-loki.sh
 #!/bin/bash
 source /etc/profile.d/struct8_vars.sh
 
-# Busca IPs de outros Lokis subindo no mesmo cluster
+# Busca IPs de outros Lokis no ASG
 LOKI_IPS=\$(aws ec2 describe-instances --region \$REGION \
   --filters "Name=tag:Name,Values=loki" "Name=instance-state-name,Values=running" \
   --query 'Reservations[*].Instances[*].PrivateIpAddress' --output text | tr '\t' ',')
@@ -82,7 +111,7 @@ exec /usr/local/bin/loki -config.file=/etc/loki/loki-config.yaml \$JOIN_ARGS
 EOF_RUN
 chmod +x /usr/local/bin/run-loki.sh
 
-# Criar e iniciar o serviço
+# Criar serviço Systemd
 cat << 'EOF_SVC' > /etc/systemd/system/loki.service
 [Unit]
 Description=Loki service
