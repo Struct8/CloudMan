@@ -1,21 +1,69 @@
+# --- BEGIN GRAFANA & HAPROXY INSTALLATION ---
+# Carregar as variáveis de ambiente exportadas acima (ex: $REGION)
 source /etc/profile.d/struct8_vars.sh
 
-# Instalar utilitários essenciais e pacote de banco (mariadb105 fornece mysql client no Amazon Linux 2023)
-dnf install -y jq mariadb105
+# Atualizar e instalar pacotes necessários (HAProxy)
+dnf update -y
+dnf install -y haproxy
 
-# Obter o secret do RDS no Secrets Manager via AWS CLI
-DB_SECRET=$(aws secretsmanager get-secret-value --secret-id "$AWS_DB_INSTANCE_SECRET_ARN_0" --region "$REGION" --query SecretString --output text)
+# Criar script de atualização dinâmica do HAProxy para apontar para as instâncias do Loki
+# Este script buscará as instâncias baseadas na Tag 'Name=loki' via AWS CLI
+cat << 'EOF_SCRIPT' > /usr/local/bin/update-haproxy-loki.sh
+#!/bin/bash
+source /etc/profile.d/struct8_vars.sh
 
-# Extrair credenciais e informações do banco
-DB_USER=$(echo $DB_SECRET | jq -r .username)
-DB_PASS=$(echo $DB_SECRET | jq -r .password)
-DB_HOST=$(echo $AWS_DB_INSTANCE_ENDPOINT_0 | cut -d':' -f1)
+# Obter IPs privados do ASG do Loki usando a tag Name=loki
+LOKI_IPS=$(aws ec2 describe-instances --region $REGION \
+  --filters "Name=tag:Name,Values=loki" "Name=instance-state-name,Values=running" \
+  --query 'Reservations[*].Instances[*].PrivateIpAddress' --output text)
 
-# Conectar ao banco RDS e criar o schema 'grafana'
-mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" -e "CREATE DATABASE IF NOT EXISTS grafana;"
+# Gerar arquivo de configuração base do HAProxy
+cat << 'EOFCONF' > /etc/haproxy/haproxy.cfg
+global
+    log /dev/log local0
+    maxconn 4096
+    user haproxy
+    group haproxy
 
-# Adicionar repositório oficial do Grafana
-cat << 'EOFREPO' > /etc/yum.repos.d/grafana.repo
+defaults
+    log global
+    mode http
+    option httplog
+    option dontlognull
+    retries 3
+    timeout connect 5000
+    timeout client  50000
+    timeout server  50000
+
+frontend loki_front
+    bind *:3100
+    default_backend loki_back
+
+backend loki_back
+    balance roundrobin
+EOFCONF
+
+# Adicionar os IPs retornados como servidores de backend do HAProxy
+INDEX=1
+for IP in $LOKI_IPS; do
+    echo "    server loki$INDEX $IP:3100 check" >> /etc/haproxy/haproxy.cfg
+    INDEX=$((INDEX+1))
+done
+
+# Recarregar o HAProxy para aplicar mudanças (ou iniciar se estiver parado)
+systemctl reload haproxy || systemctl restart haproxy
+EOF_SCRIPT
+chmod +x /usr/local/bin/update-haproxy-loki.sh
+
+# Executar o script pela primeira vez e habilitar o HAProxy no boot
+/usr/local/bin/update-haproxy-loki.sh
+systemctl enable --now haproxy
+
+# Configurar um cron job para manter a lista de IPs do Loki sempre atualizada (a cada 1 minuto)
+echo "* * * * * root /usr/local/bin/update-haproxy-loki.sh > /dev/null 2>&1" > /etc/cron.d/haproxy-loki
+
+# Configurar Repositório do Grafana (última versão)
+cat << 'EOF_REPO' > /etc/yum.repos.d/grafana.repo
 [grafana]
 name=grafana
 baseurl=https://rpm.grafana.com
@@ -25,21 +73,25 @@ gpgcheck=1
 gpgkey=https://rpm.grafana.com/gpg.key
 sslverify=1
 sslcacert=/etc/pki/tls/certs/ca-bundle.crt
-EOFREPO
+EOF_REPO
 
-# Instalar a última versão do Grafana disponível pelo repositório oficial
+# Instalar o Grafana
 dnf install -y grafana
 
-# Injetar as credenciais nas variáveis de inicialização do Grafana (substitui o SQLite padrão pelo MySQL do RDS)
-cat << EOFCONF > /etc/sysconfig/grafana-server
-GF_DATABASE_TYPE=mysql
-GF_DATABASE_HOST=$DB_HOST:3306
-GF_DATABASE_NAME=grafana
-GF_DATABASE_USER=$DB_USER
-GF_DATABASE_PASSWORD=$DB_PASS
-EOFCONF
+# Fazer o provisionamento do Datasource do Loki no Grafana
+# Ele irá se comunicar em localhost:3100, apontando pro HAProxy instalado na mesma máquina
+mkdir -p /etc/grafana/provisioning/datasources/
+cat << 'EOF_DS' > /etc/grafana/provisioning/datasources/loki.yaml
+apiVersion: 1
+datasources:
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://localhost:3100
+    isDefault: true
+EOF_DS
 
-# Habilitar o Grafana para iniciar no boot e subir o serviço
+# Habilitar e iniciar o serviço do Grafana
 systemctl daemon-reload
-systemctl enable grafana-server
-systemctl start grafana-server
+systemctl enable --now grafana-server
+# --- END GRAFANA & HAPROXY INSTALLATION ---
