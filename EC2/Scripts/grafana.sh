@@ -1,23 +1,27 @@
 # --- BEGIN GRAFANA & HAPROXY INSTALLATION ---
-# Carregar as variáveis de ambiente exportadas acima (ex: $REGION)
+# Carregar as variáveis de ambiente exportadas acima
 source /etc/profile.d/struct8_vars.sh
 
-# Atualizar e instalar pacotes necessários (HAProxy)
+# Atualizar e instalar HAProxy
 dnf update -y
 dnf install -y haproxy
 
-# Criar script de atualização dinâmica do HAProxy para apontar para as instâncias do Loki
-# Este script buscará as instâncias baseadas na Tag 'Name=loki' via AWS CLI
-cat << 'EOF_SCRIPT' > /usr/local/bin/update-haproxy-loki.sh
+# Criar script de atualização dinâmica do HAProxy (Monitorando Loki e Prometheus)
+cat << 'EOF_SCRIPT' > /usr/local/bin/update-haproxy-monitoring.sh
 #!/bin/bash
 source /etc/profile.d/struct8_vars.sh
 
-# Obter IPs privados do ASG do Loki usando a tag Name=loki
+# 1. Buscar os IPs do Loki
 LOKI_IPS=$(aws ec2 describe-instances --region $REGION \
   --filters "Name=tag:Name,Values=loki" "Name=instance-state-name,Values=running" \
   --query 'Reservations[*].Instances[*].PrivateIpAddress' --output text)
 
-# Gerar arquivo de configuração base do HAProxy
+# 2. Buscar o IP do Prometheus
+PROM_IP=$(aws ec2 describe-instances --region $REGION \
+  --filters "Name=tag:Name,Values=prometheus" "Name=instance-state-name,Values=running" \
+  --query 'Reservations[*].Instances[*].PrivateIpAddress' --output text)
+
+# 3. Gerar arquivo base do HAProxy
 cat << 'EOFCONF' > /etc/haproxy/haproxy.cfg
 global
     log /dev/log local0
@@ -35,34 +39,50 @@ defaults
     timeout client  50000
     timeout server  50000
 
+# --- FRONTEND/BACKEND LOKI ---
 frontend loki_front
     bind *:3100
     default_backend loki_back
 
 backend loki_back
     balance roundrobin
+
+# --- FRONTEND/BACKEND PROMETHEUS ---
+frontend prometheus_front
+    bind *:9090
+    default_backend prometheus_back
+
+backend prometheus_back
+    balance roundrobin
 EOFCONF
 
-# Adicionar os IPs retornados como servidores de backend do HAProxy
+# 4. Injetar instâncias do Loki no backend
 INDEX=1
 for IP in $LOKI_IPS; do
     echo "    server loki$INDEX $IP:3100 check" >> /etc/haproxy/haproxy.cfg
     INDEX=$((INDEX+1))
 done
 
-# Recarregar o HAProxy para aplicar mudanças (ou iniciar se estiver parado)
+# 5. Injetar instância do Prometheus no backend (se existir IP válido)
+if [ -n "$PROM_IP" ]; then
+    echo "    server prometheus1 $PROM_IP:9090 check" >> /etc/haproxy/haproxy.cfg
+fi
+
+# 6. Aplicar nova configuração ao HAProxy
 systemctl reload haproxy || systemctl restart haproxy
 EOF_SCRIPT
-chmod +x /usr/local/bin/update-haproxy-loki.sh
 
-# Executar o script pela primeira vez e habilitar o HAProxy no boot
-/usr/local/bin/update-haproxy-loki.sh
+# Dar permissão de execução ao script
+chmod +x /usr/local/bin/update-haproxy-monitoring.sh
+
+# Executar a primeira vez e habilitar serviço
+/usr/local/bin/update-haproxy-monitoring.sh
 systemctl enable --now haproxy
 
-# Configurar um cron job para manter a lista de IPs do Loki sempre atualizada (a cada 1 minuto)
-echo "* * * * * root /usr/local/bin/update-haproxy-loki.sh > /dev/null 2>&1" > /etc/cron.d/haproxy-loki
+# Configurar Cron Job (roda a cada minuto para manter IPs atualizados)
+echo "* * * * * root /usr/local/bin/update-haproxy-monitoring.sh > /dev/null 2>&1" > /etc/cron.d/haproxy-monitoring
 
-# Configurar Repositório do Grafana (última versão)
+# Configurar Repositório e Instalar o Grafana
 cat << 'EOF_REPO' > /etc/yum.repos.d/grafana.repo
 [grafana]
 name=grafana
@@ -75,13 +95,11 @@ sslverify=1
 sslcacert=/etc/pki/tls/certs/ca-bundle.crt
 EOF_REPO
 
-# Instalar o Grafana
 dnf install -y grafana
 
-# Fazer o provisionamento do Datasource do Loki no Grafana
-# Ele irá se comunicar em localhost:3100, apontando pro HAProxy instalado na mesma máquina
+# Configurar o Provisionamento Automático de Datasources no Grafana
 mkdir -p /etc/grafana/provisioning/datasources/
-cat << 'EOF_DS' > /etc/grafana/provisioning/datasources/loki.yaml
+cat << 'EOF_DS' > /etc/grafana/provisioning/datasources/monitoring.yaml
 apiVersion: 1
 datasources:
   - name: Loki
@@ -89,9 +107,14 @@ datasources:
     access: proxy
     url: http://localhost:3100
     isDefault: true
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://localhost:9090
+    isDefault: false
 EOF_DS
 
-# Habilitar e iniciar o serviço do Grafana
+# Iniciar o Grafana
 systemctl daemon-reload
 systemctl enable --now grafana-server
 # --- END GRAFANA & HAPROXY INSTALLATION ---
