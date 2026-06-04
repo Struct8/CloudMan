@@ -1,200 +1,373 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="pt-BR">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AppSync WebSocket Test</title>
-  <!-- Tailwind CSS para um design limpo e moderno -->
-  <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-gray-50 min-h-screen font-sans flex flex-col justify-between">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<title>AppSync Real-time Chat</title>
+		<script src="https://cdn.tailwindcss.com"></script>
+	</head>
+	<body class="flex min-h-screen items-center justify-center bg-gray-100 py-6 font-sans">
+		<div class="container mx-auto flex h-[90vh] max-w-4xl flex-col overflow-hidden rounded-lg bg-white shadow-lg">
+			
+			<!-- Header / Configurações -->
+			<header class="bg-indigo-600 p-4 text-white transition-colors duration-300" id="mainHeader">
+				<h1 class="mb-2 text-xl font-bold">AppSync Serverless Chat</h1>
+				<div class="grid grid-cols-2 gap-2 text-sm">
+					<input
+						type="text"
+						id="graphqlUrl"
+						placeholder="GraphQL URL (https://...)"
+						class="rounded px-2 py-1 text-black outline-none disabled:bg-gray-300 disabled:text-gray-500"
+					/>
+					<input
+						type="password"
+						id="apiKey"
+						placeholder="API Key"
+						class="rounded px-2 py-1 text-black outline-none disabled:bg-gray-300 disabled:text-gray-500"
+					/>
+				</div>
+				<div class="mt-2 flex gap-2">
+					<input
+						type="text"
+						id="username"
+						placeholder="Seu Nome"
+						class="flex-1 rounded px-2 py-1 text-black outline-none disabled:bg-gray-300 disabled:text-gray-500"
+					/>
+					<button
+						id="btnConnect"
+						class="rounded bg-indigo-800 px-4 py-1 transition hover:bg-indigo-900"
+					>
+						Conectar
+					</button>
+                    <button
+						id="btnDisconnect"
+						class="hidden rounded bg-red-500 px-4 py-1 font-semibold text-white transition hover:bg-red-600"
+					>
+						Desconectar
+					</button>
+				</div>
+			</header>
 
-  <div class="container mx-auto px-4 py-8 max-w-2xl">
-    <!-- Cabeçalho -->
-    <header class="mb-8 text-center">
-      <h1 class="text-3xl font-bold text-gray-800">AppSync WebSocket Test</h1>
-      <p class="text-gray-600 mt-2">Teste de recepção de dados em tempo real</p>
-    </header>
+            <!-- Área Principal: Lista de Usuários + Chat -->
+            <div class="flex flex-1 overflow-hidden">
+                
+                <!-- Sidebar de Usuários Online -->
+                <aside class="w-1/4 bg-gray-100 border-r border-gray-200 p-4 flex flex-col hidden" id="usersSidebar">
+                    <h2 class="text-sm font-bold text-gray-600 mb-3 uppercase tracking-wider">Online Agora</h2>
+                    <ul id="usersList" class="flex flex-col gap-2 overflow-y-auto">
+                        <!-- Usuários aparecerão aqui -->
+                    </ul>
+                </aside>
 
-    <!-- Formulário de Configuração -->
-    <section class="bg-white p-6 rounded-lg shadow-sm border border-gray-200 mb-6">
-      <h2 class="text-lg font-semibold text-gray-700 mb-4">Configuração da Conexão</h2>
-      
-      <div class="space-y-4">
-        <div>
-          <label class="block text-sm font-medium text-gray-600 mb-1" for="graphqlUrl">GraphQL URL</label>
-          <input type="text" id="graphqlUrl" placeholder="https://xxxxxx.appsync-api.us-east-1.amazonaws.com/graphql" 
-                 class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500 text-sm">
-        </div>
-        
-        <div>
-          <label class="block text-sm font-medium text-gray-600 mb-1" for="apiKey">API Key</label>
-          <input type="password" id="apiKey" placeholder="da2-xxxxxxxxxxxxxxxxxxxxxxxx" 
-                 class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500 text-sm">
-        </div>
+                <!-- Área de Chat -->
+                <main class="flex flex-1 flex-col gap-3 overflow-y-auto bg-gray-50 p-4" id="chatArea">
+                    <div class="flex h-full items-center justify-center text-sm text-gray-400 italic" id="statusMessage">
+                        Preencha as credenciais e conecte-se...
+                    </div>
+                </main>
 
-        <button id="btnConnect" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-4 rounded-md shadow-sm transition duration-150 text-sm">
-          Conectar ao WebSocket
-        </button>
-      </div>
-    </section>
+            </div>
 
-    <!-- Status de Conexão -->
-    <div class="flex items-center justify-between bg-white px-6 py-4 rounded-lg shadow-sm border border-gray-200 mb-6">
-      <span class="text-sm font-medium text-gray-600">Status da conexão:</span>
-      <div class="flex items-center space-x-2">
-        <span id="statusIndicator" class="h-3.0 w-3 h-3 rounded-full bg-red-500"></span>
-        <span id="statusText" class="text-sm font-semibold text-red-600">Desconectado</span>
-      </div>
-    </div>
+			<!-- Input de Mensagem -->
+			<footer
+				class="pointer-events-none flex gap-2 border-t border-gray-200 bg-white p-4 opacity-50 transition-opacity"
+				id="inputFooter"
+			>
+				<input
+					type="text"
+					id="msgInput"
+					placeholder="Digite sua mensagem..."
+					class="flex-1 rounded-full border border-gray-300 px-4 py-2 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
+				/>
+				<button
+					id="btnSend"
+					class="rounded-full bg-indigo-600 px-6 py-2 font-medium text-white transition hover:bg-indigo-700"
+				>
+					Enviar
+				</button>
+			</footer>
+		</div>
 
-    <!-- Lista de Mensagens Recebidas -->
-    <section class="bg-white p-6 rounded-lg shadow-sm border border-gray-200">
-      <div class="flex justify-between items-center mb-4">
-        <h2 class="text-lg font-semibold text-gray-700">Mensagens Recebidas</h2>
-        <button id="btnClear" class="text-xs text-gray-500 hover:text-gray-700">Limpar lista</button>
-      </div>
-      
-      <div id="messagesContainer" class="space-y-3 max-h-80 overflow-y-auto pr-2">
-        <p id="noMessages" class="text-sm text-gray-400 text-center py-8">Nenhuma mensagem recebida ainda.</p>
-      </div>
-    </section>
-  </div>
+		<script>
+			const graphqlUrlInput = document.getElementById('graphqlUrl');
+			const apiKeyInput = document.getElementById('apiKey');
+			const usernameInput = document.getElementById('username');
+			const btnConnect = document.getElementById('btnConnect');
+            const btnDisconnect = document.getElementById('btnDisconnect');
+            const mainHeader = document.getElementById('mainHeader');
+			const chatArea = document.getElementById('chatArea');
+			const inputFooter = document.getElementById('inputFooter');
+			const msgInput = document.getElementById('msgInput');
+			const btnSend = document.getElementById('btnSend');
+            const usersSidebar = document.getElementById('usersSidebar');
+            const usersList = document.getElementById('usersList');
 
-  <footer class="text-center py-4 text-xs text-gray-400 border-t border-gray-100 bg-white">
-    AWS AppSync WebSocket Client Test
-  </footer>
+			let ws = null;
+			let username = '';
+            let activeUsers = new Set(); 
+            let isFullyConnected = false; 
 
-  <!-- Carregando AWS Amplify através de um CDN ESM compatível com navegadores modernos -->
-  <script type="module">
-    import { Amplify, API, graphqlOperation } from 'https://esm.sh/aws-amplify@5.3.12';
+            // Carregar dados salvos ao iniciar a página
+            window.addEventListener('DOMContentLoaded', () => {
+                const savedUrl = localStorage.getItem('appsync_url');
+                const savedKey = localStorage.getItem('appsync_apikey');
+                const savedName = localStorage.getItem('appsync_username');
 
-    const btnConnect = document.getElementById('btnConnect');
-    const btnClear = document.getElementById('btnClear');
-    const statusIndicator = document.getElementById('statusIndicator');
-    const statusText = document.getElementById('statusText');
-    const messagesContainer = document.getElementById('messagesContainer');
-    const noMessages = document.getElementById('noMessages');
+                if (savedUrl) graphqlUrlInput.value = savedUrl;
+                if (savedKey) apiKeyInput.value = savedKey;
+                if (savedName) usernameInput.value = savedName;
+            });
 
-    let activeSubscription = null;
+			async function fetchGraphQL(query, variables = {}) {
+				const res = await fetch(graphqlUrlInput.value.trim(), {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json', 'x-api-key': apiKeyInput.value.trim() },
+					body: JSON.stringify({ query, variables })
+				});
+				return res.json();
+			}
 
-    // Função para atualizar o status visual na interface
-    function updateStatus(status) {
-      if (status === 'connected') {
-        statusIndicator.className = 'h-3 w-3 rounded-full bg-green-500';
-        statusText.innerText = 'Conectado (Ouvindo Mutation)';
-        statusText.className = 'text-sm font-semibold text-green-600';
-        btnConnect.innerText = 'Desconectar';
-        btnConnect.className = 'w-full bg-red-600 hover:bg-red-700 text-white font-medium py-2 px-4 rounded-md shadow-sm transition duration-150 text-sm';
-      } else if (status === 'connecting') {
-        statusIndicator.className = 'h-3 w-3 rounded-full bg-yellow-500';
-        statusText.innerText = 'Conectando...';
-        statusText.className = 'text-sm font-semibold text-yellow-600';
-        btnConnect.disabled = true;
-      } else {
-        statusIndicator.className = 'h-3 w-3 rounded-full bg-red-500';
-        statusText.innerText = 'Desconectado';
-        statusText.className = 'text-sm font-semibold text-red-600';
-        btnConnect.innerText = 'Conectar ao WebSocket';
-        btnConnect.disabled = false;
-        btnConnect.className = 'w-full bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-4 rounded-md shadow-sm transition duration-150 text-sm';
-      }
-    }
-
-    // Função para renderizar uma nova mensagem recebida na tela
-    function appendMessage(content) {
-      if (noMessages) {
-        noMessages.style.display = 'none';
-      }
-
-      const time = new Date().toLocaleTimeString();
-      const messageDiv = document.createElement('div');
-      messageDiv.className = 'bg-gray-50 border border-gray-100 rounded-lg p-3 text-sm flex justify-between items-start shadow-sm transition duration-300 ease-in-out transform translate-y-1 animate-fade-in';
-      
-      messageDiv.innerHTML = `
-        <span class="text-gray-800 font-medium">${content}</span>
-        <span class="text-xs text-gray-400 whitespace-nowrap ml-4">${time}</span>
-      `;
-      
-      messagesContainer.prepend(messageDiv);
-    }
-
-    // Gerenciador de conexão
-    function toggleConnection() {
-      if (activeSubscription) {
-        // Desconectar
-        activeSubscription.unsubscribe();
-        activeSubscription = null;
-        updateStatus('disconnected');
-        return;
-      }
-
-      const graphqlUrl = document.getElementById('graphqlUrl').value.trim();
-      const apiKey = document.getElementById('apiKey').value.trim();
-
-      if (!graphqlUrl || !apiKey) {
-        alert('Por favor, preencha o campo GraphQL URL e a API Key antes de conectar.');
-        return;
-      }
-
-      updateStatus('connecting');
-
-      try {
-        // Configura o cliente do Amplify
-        Amplify.configure({
-          aws_appsync_graphqlEndpoint: graphqlUrl,
-          aws_appsync_region: 'us-east-1', // Certifique-se de usar a mesma região do Terraform
-          aws_appsync_authenticationType: 'API_KEY',
-          aws_appsync_apiKey: apiKey
-        });
-
-        // Query de Subscription idêntica à declarada no Schema do AppSync
-        const subscriptionQuery = `
-          subscription OnPublishMessage {
-            onPublishMessage {
-              id
-              content
+            function updateUsersUI() {
+                usersList.innerHTML = '';
+                activeUsers.forEach(user => {
+                    const li = document.createElement('li');
+                    li.className = 'text-sm font-medium text-gray-700 bg-white p-2 rounded shadow-sm border border-gray-100 flex items-center gap-2';
+                    li.innerHTML = `<span class="w-2 h-2 rounded-full bg-green-500"></span> ${user} ${user === username ? '(Você)' : ''}`;
+                    usersList.appendChild(li);
+                });
             }
-          }
-        `;
 
-        // Inicia a escuta da Subscription
-        activeSubscription = API.graphql(
-          graphqlOperation(subscriptionQuery)
-        ).subscribe({
-          next: ({ value }) => {
-            const data = value.data.onPublishMessage;
-            appendMessage(data.content);
-          },
-          error: (err) => {
-            console.error('Erro na subscription:', err);
-            alert('Falha ao conectar no WebSocket do AppSync. Verifique o console e os parâmetros fornecidos.');
-            updateStatus('disconnected');
-            activeSubscription = null;
-          }
-        });
+			function appendMessage(sender, content, isSystem = false) {
+				const div = document.createElement('div');
 
-        // Pequeno atraso para atualizar o status visual após iniciar a conexão
-        setTimeout(() => {
-          if (activeSubscription) {
-            updateStatus('connected');
-          }
-        }, 1500);
+				if (isSystem) {
+					div.className = 'text-center text-xs text-gray-500 italic my-2';
+					div.innerText = `${sender} ${content}`;
+				} else {
+					const isMe = sender === username;
+					div.className = `max-w-[70%] rounded-lg px-4 py-2 shadow-sm ${isMe ? 'bg-indigo-500 text-white self-end rounded-br-none' : 'bg-white border border-gray-200 text-gray-800 self-start rounded-bl-none'}`;
+					div.innerHTML = `<span class="block text-xs font-bold ${isMe ? 'text-indigo-200' : 'text-indigo-600'} mb-1">${sender}</span><span class="text-sm">${content}</span>`;
+				}
 
-      } catch (error) {
-        console.error('Erro de configuração:', error);
-        updateStatus('disconnected');
-      }
-    }
+				chatArea.appendChild(div);
+				chatArea.scrollTop = chatArea.scrollHeight;
+			}
 
-    // Eventos dos botões
-    btnConnect.addEventListener('click', toggleConnection);
-    
-    btnClear.addEventListener('click', () => {
-      messagesContainer.innerHTML = '';
-      messagesContainer.appendChild(noMessages);
-      noMessages.style.display = 'block';
-    });
-  </script>
-</body>
+			btnConnect.addEventListener('click', async () => {
+				username = usernameInput.value.trim();
+				if (!username || !graphqlUrlInput.value || !apiKeyInput.value) {
+					alert('Preencha URL, API Key e Nome!');
+					return;
+				}
+
+                localStorage.setItem('appsync_url', graphqlUrlInput.value.trim());
+                localStorage.setItem('appsync_apikey', apiKeyInput.value.trim());
+                localStorage.setItem('appsync_username', username);
+
+                graphqlUrlInput.disabled = true;
+                apiKeyInput.disabled = true;
+                usernameInput.disabled = true;
+                
+                btnConnect.innerText = 'Conectando...';
+
+				chatArea.innerHTML = '<div class="flex h-full items-center justify-center text-sm text-gray-500">Carregando histórico...</div>';
+
+				try {
+					const historyRes = await fetchGraphQL(`query { getMessages { sender content timestamp } }`);
+					chatArea.innerHTML = '';
+					
+                    if (historyRes.data?.getMessages) {
+                        const messages = historyRes.data.getMessages.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+						messages.forEach((m) => appendMessage(m.sender, m.content));
+					}
+
+					setupAppSyncWebSocket();
+				} catch (err) {
+					chatArea.innerHTML = `<div class="flex h-full items-center justify-center text-red-500">Erro: ${err.message}</div>`;
+                    resetUI();
+				}
+			});
+
+            // NOVO: Notifica a saída dos outros usuários ao desconectar de forma ativa
+            btnDisconnect.addEventListener('click', async () => {
+                if (isFullyConnected) {
+                    // Notifica os outros clientes antes de fechar o socket
+                    await fetchGraphQL(`mutation($sender: String!) { userJoined(sender: $sender) }`, { 
+                        sender: `LEFT:${username}` 
+                    });
+                }
+                
+                if (ws) {
+                    ws.close();
+                    ws = null;
+                }
+                resetUI();
+                chatArea.innerHTML = '<div class="flex h-full items-center justify-center text-sm text-gray-400 italic">Desconectado.</div>';
+            });
+
+            // NOVO: Envia o beacon de desconexão mesmo se fechar a aba/janela do navegador de repente
+            window.addEventListener('beforeunload', () => {
+                if (isFullyConnected && username) {
+                    const url = graphqlUrlInput.value.trim();
+                    const apiKey = apiKeyInput.value.trim();
+                    const mutation = `mutation($sender: String!) { userJoined(sender: $sender) }`;
+                    const variables = { sender: `LEFT:${username}` };
+                    
+                    // keepalive: true permite que a requisição HTTP termine de executar em segundo plano após fechar a aba
+                    fetch(url, {
+                        method: 'POST',
+                        headers: { 
+                            'Content-Type': 'application/json', 
+                            'x-api-key': apiKey 
+                        },
+                        body: JSON.stringify({ query: mutation, variables }),
+                        keepalive: true 
+                    });
+                }
+            });
+
+            function resetUI() {
+                btnConnect.classList.remove('hidden');
+                btnConnect.innerText = 'Conectar';
+                btnDisconnect.classList.add('hidden');
+                mainHeader.classList.replace('bg-green-700', 'bg-indigo-600');
+
+                graphqlUrlInput.disabled = false;
+                apiKeyInput.disabled = false;
+                usernameInput.disabled = false;
+
+                inputFooter.classList.add('opacity-50', 'pointer-events-none');
+                usersSidebar.classList.add('hidden');
+
+                activeUsers.clear();
+                usersList.innerHTML = '';
+                isFullyConnected = false;
+            }
+
+			function setupAppSyncWebSocket() {
+				const url = graphqlUrlInput.value.trim();
+				const apiKey = apiKeyInput.value.trim();
+				const host = new URL(url).host;
+
+				const wssUrl = url.replace('https://', 'wss://').replace('appsync-api', 'appsync-realtime-api') + '/graphql';
+				const authHeader = { host: host, 'x-api-key': apiKey };
+				const headerB64 = btoa(JSON.stringify(authHeader));
+				const payloadB64 = btoa(JSON.stringify({}));
+
+				ws = new WebSocket(`${wssUrl}?header=${headerB64}&payload=${payloadB64}`, ['graphql-ws']);
+
+				ws.onopen = () => { ws.send(JSON.stringify({ type: 'connection_init' })); };
+
+				ws.onmessage = (event) => {
+					const msg = JSON.parse(event.data);
+
+                    if (msg.type === 'error') {
+                        console.error('Erro de Protocolo AppSync Real-time:', msg.payload);
+                    }
+
+					if (msg.type === 'connection_ack') {
+						inputFooter.classList.remove('opacity-50', 'pointer-events-none');
+                        usersSidebar.classList.remove('hidden');
+                        
+                        btnConnect.classList.add('hidden');
+                        btnDisconnect.classList.remove('hidden');
+                        mainHeader.classList.replace('bg-indigo-600', 'bg-green-700');
+                        
+                        activeUsers.add(username);
+                        updateUsersUI();
+
+						subscribeToChat(authHeader);
+
+						fetchGraphQL(`mutation($sender: String!) { userJoined(sender: $sender) }`, { sender: username });
+                        
+                        isFullyConnected = true; 
+					} else if (msg.type === 'data') {
+						const payload = msg.payload.data;
+						if (payload.onMessageReceived) {
+							appendMessage(payload.onMessageReceived.sender, payload.onMessageReceived.content);
+						} else if (payload.onUserJoined) {
+                            const rawUser = payload.onUserJoined;
+                            
+                            // NOVO: Detecta se o evento recebido é uma sinalização de saída (LEFT:Nome)
+                            if (rawUser.startsWith('LEFT:')) {
+                                const leftUser = rawUser.replace('LEFT:', '');
+                                if (leftUser !== username) {
+                                    activeUsers.delete(leftUser); // Remove da lista de online
+                                    updateUsersUI(); // Atualiza a barra lateral
+                                    appendMessage(leftUser, 'saiu da sala.', true); // Mostra no chat
+                                }
+                            } else {
+                                // Evento padrão de entrada (JOIN)
+                                const newUser = rawUser;
+                                if (newUser !== username) {
+                                    if (!activeUsers.has(newUser)) {
+                                        activeUsers.add(newUser);
+                                        updateUsersUI();
+                                        appendMessage(newUser, 'entrou na sala.', true);
+                                        
+                                        if (isFullyConnected) {
+                                            fetchGraphQL(`mutation($sender: String!) { userJoined(sender: $sender) }`, { sender: username });
+                                        }
+                                    }
+                                }
+                            }
+						}
+					}
+				};
+                
+                ws.onclose = () => {
+                    if (btnDisconnect.classList.contains('hidden') === false) {
+                        resetUI();
+                        chatArea.innerHTML += '<div class="text-center text-xs text-red-500 my-2">Conexão encerrada.</div>';
+                    }
+                };
+			}
+
+			function subscribeToChat(authHeader) {
+				const subMessage = `subscription { onMessageReceived { sender content } }`;
+				const subJoin = `subscription { onUserJoined }`;
+                
+				const createSubMsg = (id, query) => {
+                    const graphqlObj = {
+                        query: query,
+                        variables: {}
+                    };
+                    return JSON.stringify({ 
+                        id: id, 
+                        type: 'start', 
+                        payload: { 
+                            data: JSON.stringify(graphqlObj), 
+                            extensions: { authorization: authHeader } 
+                        } 
+                    });
+                };
+
+				ws.send(createSubMsg('sub-msg', subMessage));
+				ws.send(createSubMsg('sub-join', subJoin));
+			}
+
+			async function sendMessage() {
+				const content = msgInput.value.trim();
+				if (!content) return;
+
+				msgInput.value = '';
+
+				const mutation = `
+                    mutation($sender: String!, $content: String!) {
+                        sendMessage(sender: $sender, content: $content) { 
+                            id
+                            sender
+                            content 
+                        }
+                    }
+                `;
+				await fetchGraphQL(mutation, { sender: username, content });
+			}
+
+			btnSend.addEventListener('click', sendMessage);
+			msgInput.addEventListener('keypress', (e) => {
+				if (e.key === 'Enter') sendMessage();
+			});
+		</script>
+	</body>
 </html>
