@@ -4,7 +4,7 @@ import csv
 import io
 import os
 import gzip
-import re # Importar módulo de expressões regulares
+import re
 import urllib.parse
 from decimal import Decimal, getcontext, InvalidOperation
 from datetime import datetime, timedelta, timezone
@@ -12,11 +12,17 @@ from datetime import datetime, timedelta, timezone
 # --- Constantes e Configuração ---
 # Chave da tag a ser usada para agrupar os custos
 RESOURCE_TAG_KEY = os.environ.get('RESOURCE_TAG_KEY', 'resourceTags/user:Name')
+
 # Colunas padrão do CUR a serem usadas
 COST_COLUMN = 'lineItem/UnblendedCost'
 PRODUCT_COLUMN = 'lineItem/ProductCode'
 USAGE_TYPE_COLUMN = 'lineItem/UsageType'
-# DATE_COLUMN foi removida
+
+# Usamos .get() para não quebrar a inicialização da Lambda caso a variável não exista
+CUR_BUCKET_NAME_FALLBACK = os.environ.get('AWS_S3_BUCKET_NAME_0')
+
+# Variável de destino do arquivo consolidado (se não houver TARGET, tenta usar o mesmo fallback)
+CONSOLIDATED_BUCKET_NAME = os.environ.get('AWS_S3_BUCKET_TARGET_NAME_0', CUR_BUCKET_NAME_FALLBACK)
 
 # --- Configuração do Arquivo JSON Consolidado ---
 CONSOLIDATED_KEY = os.getenv("CONSOLIDATED_KEY", "consolidated-costs/daily_costs_by_tag.json")
@@ -33,7 +39,7 @@ except ValueError:
 
 s3_client = boto3.client('s3')
 
-# --- Funções Helper (decimal_default, load_consolidated_data, save_consolidated_data - sem alterações) ---
+# --- Funções Helper ---
 
 def decimal_default(obj):
     if isinstance(obj, Decimal): return str(obj)
@@ -69,26 +75,25 @@ def save_consolidated_data(bucket, key, data):
         print(f"ERROR: Failed to save consolidated data to s3://{bucket}/{key}. Error: {e}")
         raise
 
-# --- Lógica de Processamento do CUR (data SOMENTE do path) ---
+# --- Lógica de Processamento do CUR ---
 
 def process_cur_file(bucket_name, object_key):
-    print("process_cur_file object_key",object_key)
+    print("process_cur_file object_key:", object_key)
     """
     Processa um único arquivo CUR. Extrai a data 'YYYY-MM-DD' OBRIGATORIAMENTE
     do caminho do objeto S3 (object_key) procurando por 'YYYYMMDDTHHMMSSZ'.
-    Se a data não for encontrada no caminho, retorna erro.
-    Retorna (data_str, dados_agregados_dia, codigo_moeda) ou (None, {}, None).
     """
     daily_costs_by_tag = {}
     processing_date_str = None
     currency_code = None
     body = None
     text_stream = None
+    
     print(f"Attempting to process CUR file: s3://{bucket_name}/{object_key}")
-    # --- PASSO 1: Extrair data OBRIGATORIAMENTE do caminho/nome do arquivo ---
+    
+    # --- PASSO 1: Extrair data ---
     print(f"Attempting to extract date from object key: {object_key}")
-    # Regex para encontrar 'YYYYMMDD' seguido por 'T', 6 dígitos, 'Z', dentro de diretórios
-    match = re.search(r'/(\d{8})T\d{6}Z/', '/' + object_key + '/') # Adiciona barras delimitadoras
+    match = re.search(r'/(\d{8})T\d{6}Z/', '/' + object_key + '/')
     if match:
         date_yyyymmdd = match.group(1)
         try:
@@ -97,13 +102,12 @@ def process_cur_file(bucket_name, object_key):
             print(f"Successfully extracted date from object key: {processing_date_str}")
         except ValueError:
             print(f"ERROR: Found potential date '{date_yyyymmdd}' in key, but failed to parse it.")
-            return None, {}, None # Falha no parse da data encontrada é um erro fatal aqui
+            return None, {}, None
     else:
         print(f"ERROR: Could not find required date pattern (YYYYMMDDTHHMMSSZ) in object key: {object_key}")
-        return None, {}, None # Não encontrar a data na chave é um erro fatal aqui
+        return None, {}, None
 
-    # --- PASSO 2: Processar o Arquivo CSV para custos e moeda ---
-    # A data (processing_date_str) já foi determinada com sucesso se chegamos aqui.
+    # --- PASSO 2: Processar o Arquivo CSV ---
     try:
         s3_object = s3_client.get_object(Bucket=bucket_name, Key=object_key)
         body = s3_object['Body']
@@ -119,53 +123,49 @@ def process_cur_file(bucket_name, object_key):
         csv_reader = csv.DictReader(text_stream)
         print("CSV stream configured. Processing rows for costs and currency...")
         processed_rows = 0
-        currency_found = False # Flag para pegar moeda só uma vez
+        currency_found = False
 
         for row_num, row in enumerate(csv_reader):
             processed_rows += 1
 
-            # Tenta pegar a moeda nas primeiras linhas
-            if not currency_found and processed_rows <= 10: # Limita a busca por moeda
+            if not currency_found and processed_rows <= 10:
                 currency_code_found = row.get('lineItem/CurrencyCode', row.get('pricing/currency'))
                 if currency_code_found:
                     currency_code = currency_code_found
                     currency_found = True
                     print(f"Determined currency code: {currency_code}")
 
-            # --- Lógica de Agregação (sem alterações na estrutura) ---
             tag_value = row.get(RESOURCE_TAG_KEY)
             if not tag_value: tag_value = "Untagged"
             cost_str = row.get(COST_COLUMN)
             try:
                 cost = Decimal(cost_str) if cost_str else Decimal('0.0')
             except (InvalidOperation, TypeError): cost = Decimal('0.0')
-            if cost == Decimal('0.0'): continue # Ignora linhas sem custo
+            if cost == Decimal('0.0'): continue
+            
             product_code = row.get(PRODUCT_COLUMN) or 'UnknownProduct'
             usage_type = row.get(USAGE_TYPE_COLUMN) or 'UnknownUsageType'
+            
             if tag_value not in daily_costs_by_tag:
                 daily_costs_by_tag[tag_value] = {"TotalUnblendedCost": Decimal('0.0'), "CostsByProduct": {}}
             daily_costs_by_tag[tag_value]['TotalUnblendedCost'] += cost
+            
             if product_code not in daily_costs_by_tag[tag_value]['CostsByProduct']:
                 daily_costs_by_tag[tag_value]['CostsByProduct'][product_code] = {}
             costs_by_usage = daily_costs_by_tag[tag_value]['CostsByProduct'][product_code]
             if usage_type not in costs_by_usage: costs_by_usage[usage_type] = Decimal('0.0')
             costs_by_usage[usage_type] += cost
-            # --- Fim Agregação ---
 
-        # --- Fim do processamento do arquivo ---
         print(f"Finished processing CUR file content. Total rows scanned: {processed_rows}.")
 
         if processed_rows == 0:
             print("Warning: CUR file was empty, but date was extracted from key. Proceeding with potentially zero costs.")
-            # Retorna a data da chave e um dicionário vazio de custos
 
-        # Converte Decimals para String antes de retornar
         final_daily_costs_dict = json.loads(json.dumps(daily_costs_by_tag, default=decimal_default))
 
         print(f"Aggregation complete for date {processing_date_str}. Found {len(final_daily_costs_dict)} tags with costs.")
         return processing_date_str, final_daily_costs_dict, currency_code
 
-    # --- Tratamento de Erros Específicos ---
     except s3_client.exceptions.NoSuchKey:
         print(f"Error: CUR file not found - s3://{bucket_name}/{object_key}")
         return None, {}, None
@@ -189,51 +189,54 @@ def process_cur_file(bucket_name, object_key):
              except Exception as close_err: print(f"Warning: Error closing S3 body stream: {close_err}")
 
 
-# --- Função Lambda Handler Principal (sem alterações significativas aqui) ---
+# --- Função Lambda Handler Principal ---
 
 def lambda_handler(event, context):
     """ Ponto de entrada da Lambda """
     print(f"Lambda execution started. Received event: {json.dumps(event)}")
 
-    cur_bucket_name = None
     cur_object_key = None
-
+    cur_bucket_name = None
 
     # --- 1. Determinar Bucket/Chave do Arquivo CUR de Entrada ---
     try:
+        # Tenta extrair do evento de notificação do S3
         if 'Records' in event and isinstance(event['Records'], list) and event['Records'] and isinstance(event['Records'][0], dict) and 's3' in event['Records'][0]:
             s3_event = event['Records'][0]['s3']
             cur_bucket_name = s3_event['bucket']['name']
             cur_object_key = urllib.parse.unquote_plus(s3_event['object']['key'], encoding='utf-8')
             print(f"Triggered by S3 event. Processing CUR file: s3://{cur_bucket_name}/{cur_object_key}")
+        
+        # Invocaçao manual (como por exemplo via API/Teste enviando um "object_key")
         elif isinstance(event, dict) and 'object_key' in event:
             cur_object_key = event['object_key']
-            print("cur_object_key",cur_object_key)
-            try:
-                cur_bucket_name = os.environ['AWS_S3_BUCKET_TARGET_NAME_0']
-                print(f"Triggered by direct invocation. object_key='{cur_object_key}'. Using CUR bucket from env var AWS_S3_BUCKET_TARGET_NAME_0: {cur_bucket_name}")
-            except KeyError:
-                print("CRITICAL ERROR: Env var AWS_S3_BUCKET_TARGET_NAME_0 is required for CUR bucket in direct invocation but is not set!")
-                return {'statusCode': 500, 'body': 'Configuration Error: AWS_S3_BUCKET_TARGET_NAME_0 missing for direct invocation.'}
+            print("cur_object_key:", cur_object_key)
+            
+            # Aqui usamos o Fallback seguro caso o bucket não venha no evento da chamada direta
+            if CUR_BUCKET_NAME_FALLBACK:
+                cur_bucket_name = CUR_BUCKET_NAME_FALLBACK
+                print(f"Triggered by direct invocation. object_key='{cur_object_key}'. Using CUR bucket from env var: {cur_bucket_name}")
+            else:
+                print("CRITICAL ERROR: Env var AWS_S3_BUCKET_NAME_0 is required for CUR bucket in direct invocation but is not set!")
+                return {'statusCode': 500, 'body': 'Configuration Error: AWS_S3_BUCKET_NAME_0 missing for direct invocation fallback.'}
+        
         else:
             print(f"ERROR: Invalid event structure. Cannot determine CUR file source. Event dump: {json.dumps(event)}")
             return {'statusCode': 400, 'body': 'Invalid event structure for CUR file source.'}
+            
     except (KeyError, IndexError, TypeError) as e:
          print(f"ERROR: Could not parse expected S3 event details. Error: {e}")
          return {'statusCode': 400, 'body': 'Error parsing S3 event structure.'}
-    
-
 
     if not cur_bucket_name or not cur_object_key:
          print("ERROR: Failed to determine CUR bucket name or clean object key after checking event types.")
          return {'statusCode': 400, 'body': 'Could not determine CUR S3 bucket or key.'}
 
     # --- 2. Determinar Bucket/Chave do JSON CONSOLIDADO (Saída) ---
-    try:
-        consolidated_bucket = os.environ['AWS_S3_BUCKET_TARGET_NAME_0']
-    except KeyError:
-        print("CRITICAL ERROR: Environment variable AWS_S3_BUCKET_TARGET_NAME_0 (for consolidated file target) is not set!")
-        return {'statusCode': 500, 'body': 'Configuration Error: Target bucket env var AWS_S3_BUCKET_TARGET_NAME_0 missing.'}
+    consolidated_bucket = CONSOLIDATED_BUCKET_NAME
+    if not consolidated_bucket:
+        print("CRITICAL ERROR: Environment variable for consolidated file target is not set!")
+        return {'statusCode': 500, 'body': 'Configuration Error: Target bucket env var missing.'}
 
     consolidated_key = CONSOLIDATED_KEY
     print(f"Consolidated JSON target location: s3://{consolidated_bucket}/{consolidated_key}")
@@ -241,10 +244,9 @@ def lambda_handler(event, context):
     print(f"Data retention period set to: {DAYS_TO_RETAIN} days")
 
     # --- 3. Processar o Arquivo CUR de Entrada ---
-    # Passa a chave limpa para process_cur_file
+    # Passa o bucket resolvido e a chave limpa para process_cur_file
     processing_date_str, daily_costs_data, currency_code = process_cur_file(cur_bucket_name, cur_object_key)
 
-    # Se process_cur_file falhar (agora principalmente por não achar data na chave)
     if not processing_date_str or daily_costs_data is None:
         print("ERROR: Failed to process CUR file (likely date extraction from key failed or file access error). Aborting update.")
         return {'statusCode': 200, 'body': 'Failed to process CUR file; no update performed.'}
@@ -282,6 +284,7 @@ def lambda_handler(event, context):
         if tag_value not in consolidated_data[costs_main_key]: continue
         dates_to_delete_for_this_tag = []
         tag_date_data = consolidated_data[costs_main_key][tag_value]
+        
         for date_str in tag_date_data.keys():
             try:
                 data_date = datetime.strptime(date_str, '%Y-%m-%d').date()
@@ -290,11 +293,13 @@ def lambda_handler(event, context):
             except ValueError:
                 print(f"Warning: Invalid date format key '{date_str}' under tag '{tag_value}'. Skipping.")
                 continue
+                
         if dates_to_delete_for_this_tag:
             print(f"  Pruning tag '{tag_value}': Removing dates {dates_to_delete_for_this_tag}")
             for date_to_delete in dates_to_delete_for_this_tag:
                 del consolidated_data[costs_main_key][tag_value][date_to_delete]
                 dates_removed_count += 1
+                
         if not consolidated_data[costs_main_key][tag_value]:
             empty_tags_after_pruning.append(tag_value)
 
@@ -302,6 +307,7 @@ def lambda_handler(event, context):
         print(f"Removing {len(empty_tags_after_pruning)} tags that became empty after pruning: {empty_tags_after_pruning}")
         for tag_to_delete in empty_tags_after_pruning:
             del consolidated_data[costs_main_key][tag_to_delete]
+            
     print(f"Pruning complete. Total old date entries removed: {dates_removed_count}. Empty tags removed: {len(empty_tags_after_pruning)}.")
 
     # --- 7. Atualizar Metadados ---
@@ -325,7 +331,7 @@ def lambda_handler(event, context):
         'statusCode': 200,
         'body': json.dumps({
             'message': 'Consolidated cost data updated successfully.',
-            'processed_cur_file': f's3://{cur_bucket_name}/{cur_object_key}', # Usa chave limpa
+            'processed_cur_file': f's3://{cur_bucket_name}/{cur_object_key}',
             'processed_date': processing_date_str,
             'consolidated_file': f's3://{consolidated_bucket}/{consolidated_key}',
             'tags_updated_for_date': updated_tags_count,
