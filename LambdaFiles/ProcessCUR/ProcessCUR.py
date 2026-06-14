@@ -18,11 +18,9 @@ COST_COLUMN = 'lineItem/UnblendedCost'
 PRODUCT_COLUMN = 'lineItem/ProductCode'
 USAGE_TYPE_COLUMN = 'lineItem/UsageType'
 
-# Usamos .get() para não quebrar a inicialização da Lambda caso a variável não exista
-CUR_BUCKET_NAME_FALLBACK = os.environ.get('AWS_S3_BUCKET_NAME_0')
-
-# Variável de destino do arquivo consolidado (se não houver TARGET, tenta usar o mesmo fallback)
-CONSOLIDATED_BUCKET_NAME = os.environ.get('AWS_S3_BUCKET_TARGET_NAME_0', CUR_BUCKET_NAME_FALLBACK)
+# Resolução robusta de variáveis de ambiente (evita problemas com strings vazias)
+CUR_BUCKET_NAME_FALLBACK = os.environ.get('AWS_S3_BUCKET_NAME_0') or os.environ.get('AWS_S3_BUCKET_TARGET_NAME_0')
+CONSOLIDATED_BUCKET_NAME = os.environ.get('AWS_S3_BUCKET_TARGET_NAME_0') or CUR_BUCKET_NAME_FALLBACK
 
 # --- Configuração do Arquivo JSON Consolidado ---
 CONSOLIDATED_KEY = os.getenv("CONSOLIDATED_KEY", "consolidated-costs/daily_costs_by_tag.json")
@@ -79,10 +77,12 @@ def save_consolidated_data(bucket, key, data):
 
 def process_cur_file(bucket_name, object_key):
     print("process_cur_file object_key:", object_key)
-    """
-    Processa um único arquivo CUR. Extrai a data 'YYYY-MM-DD' OBRIGATORIAMENTE
-    do caminho do objeto S3 (object_key) procurando por 'YYYYMMDDTHHMMSSZ'.
-    """
+    
+    # Ignorar arquivos de manifesto, metadados ou JSON gerados pelo CUR para evitar falhas de parsing
+    if not (object_key.lower().endswith('.csv') or object_key.lower().endswith('.csv.gz')):
+        print(f"Skipping non-data file (manifest or metadata): {object_key}")
+        return None, {}, None
+
     daily_costs_by_tag = {}
     processing_date_str = None
     currency_code = None
@@ -91,9 +91,9 @@ def process_cur_file(bucket_name, object_key):
     
     print(f"Attempting to process CUR file: s3://{bucket_name}/{object_key}")
     
-    # --- PASSO 1: Extrair data ---
+    # --- PASSO 1: Extrair data de forma compatível com prefixos e subpastas ---
     print(f"Attempting to extract date from object key: {object_key}")
-    match = re.search(r'/(\d{8})T\d{6}Z/', '/' + object_key + '/')
+    match = re.search(r'(\d{8})T\d{6}Z', object_key)
     if match:
         date_yyyymmdd = match.group(1)
         try:
@@ -107,7 +107,7 @@ def process_cur_file(bucket_name, object_key):
         print(f"ERROR: Could not find required date pattern (YYYYMMDDTHHMMSSZ) in object key: {object_key}")
         return None, {}, None
 
-    # --- PASSO 2: Processar o Arquivo CSV ---
+    # --- PASSO 2: Processar o Arquivo CSV (com suporte a GZ) ---
     try:
         s3_object = s3_client.get_object(Bucket=bucket_name, Key=object_key)
         body = s3_object['Body']
@@ -115,9 +115,11 @@ def process_cur_file(bucket_name, object_key):
         is_gzipped = object_key.lower().endswith('.gz')
 
         if is_gzipped:
+            print("Detected Gzip file compression. Initializing decompression stream.")
             gzip_stream = gzip.GzipFile(fileobj=body)
             text_stream = io.TextIOWrapper(gzip_stream, encoding='utf-8', errors='replace')
         else:
+            print("No compression detected. Processing as plain text CSV.")
             text_stream = io.TextIOWrapper(body, encoding='utf-8', errors='replace')
 
         csv_reader = csv.DictReader(text_stream)
@@ -192,7 +194,6 @@ def process_cur_file(bucket_name, object_key):
 # --- Função Lambda Handler Principal ---
 
 def lambda_handler(event, context):
-    """ Ponto de entrada da Lambda """
     print(f"Lambda execution started. Received event: {json.dumps(event)}")
 
     cur_object_key = None
@@ -200,25 +201,22 @@ def lambda_handler(event, context):
 
     # --- 1. Determinar Bucket/Chave do Arquivo CUR de Entrada ---
     try:
-        # Tenta extrair do evento de notificação do S3
         if 'Records' in event and isinstance(event['Records'], list) and event['Records'] and isinstance(event['Records'][0], dict) and 's3' in event['Records'][0]:
             s3_event = event['Records'][0]['s3']
             cur_bucket_name = s3_event['bucket']['name']
             cur_object_key = urllib.parse.unquote_plus(s3_event['object']['key'], encoding='utf-8')
             print(f"Triggered by S3 event. Processing CUR file: s3://{cur_bucket_name}/{cur_object_key}")
         
-        # Invocaçao manual (como por exemplo via API/Teste enviando um "object_key")
         elif isinstance(event, dict) and 'object_key' in event:
             cur_object_key = event['object_key']
             print("cur_object_key:", cur_object_key)
             
-            # Aqui usamos o Fallback seguro caso o bucket não venha no evento da chamada direta
             if CUR_BUCKET_NAME_FALLBACK:
                 cur_bucket_name = CUR_BUCKET_NAME_FALLBACK
                 print(f"Triggered by direct invocation. object_key='{cur_object_key}'. Using CUR bucket from env var: {cur_bucket_name}")
             else:
-                print("CRITICAL ERROR: Env var AWS_S3_BUCKET_NAME_0 is required for CUR bucket in direct invocation but is not set!")
-                return {'statusCode': 500, 'body': 'Configuration Error: AWS_S3_BUCKET_NAME_0 missing for direct invocation fallback.'}
+                print("CRITICAL ERROR: Fallback bucket environment variable is required but is not set!")
+                return {'statusCode': 500, 'body': 'Configuration Error: Fallback bucket env var missing.'}
         
         else:
             print(f"ERROR: Invalid event structure. Cannot determine CUR file source. Event dump: {json.dumps(event)}")
@@ -229,7 +227,7 @@ def lambda_handler(event, context):
          return {'statusCode': 400, 'body': 'Error parsing S3 event structure.'}
 
     if not cur_bucket_name or not cur_object_key:
-         print("ERROR: Failed to determine CUR bucket name or clean object key after checking event types.")
+         print("ERROR: Failed to determine CUR bucket name or clean object key.")
          return {'statusCode': 400, 'body': 'Could not determine CUR S3 bucket or key.'}
 
     # --- 2. Determinar Bucket/Chave do JSON CONSOLIDADO (Saída) ---
@@ -244,12 +242,11 @@ def lambda_handler(event, context):
     print(f"Data retention period set to: {DAYS_TO_RETAIN} days")
 
     # --- 3. Processar o Arquivo CUR de Entrada ---
-    # Passa o bucket resolvido e a chave limpa para process_cur_file
     processing_date_str, daily_costs_data, currency_code = process_cur_file(cur_bucket_name, cur_object_key)
 
     if not processing_date_str or daily_costs_data is None:
-        print("ERROR: Failed to process CUR file (likely date extraction from key failed or file access error). Aborting update.")
-        return {'statusCode': 200, 'body': 'Failed to process CUR file; no update performed.'}
+        print("INFO: CUR file bypassed or process skipped (possibly a non-CSV file or metadata). No update performed.")
+        return {'statusCode': 200, 'body': 'CUR file skipped or processing resulted in no data; no update performed.'}
 
     print(f"Successfully processed CUR for date: {processing_date_str}. Currency: {currency_code or 'Not Found'}.")
 
@@ -325,7 +322,6 @@ def lambda_handler(event, context):
         print(f"CRITICAL ERROR: Failed to save updated consolidated data to s3://{consolidated_bucket}/{consolidated_key}. Error: {e}")
         return {'statusCode': 500, 'body': f'Failed to save updated consolidated data: {str(e)}'}
 
-    # --- Fim da Execução ---
     print("Lambda execution finished successfully.")
     return {
         'statusCode': 200,
