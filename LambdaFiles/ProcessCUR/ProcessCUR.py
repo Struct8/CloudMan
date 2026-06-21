@@ -19,14 +19,24 @@ USAGE_START_DATE_COLUMN = 'lineItem/UsageStartDate'
 CUR_BUCKET_NAME_FALLBACK = os.environ.get('AWS_S3_BUCKET_NAME_0') or os.environ.get('AWS_S3_BUCKET_TARGET_NAME_0')
 CONSOLIDATED_BUCKET_NAME = os.environ.get('AWS_S3_BUCKET_TARGET_NAME_0') or CUR_BUCKET_NAME_FALLBACK
 CONSOLIDATED_KEY = os.getenv("CONSOLIDATED_KEY", "consolidated-costs/daily_costs_by_tag.json")
-DAYS_TO_RETAIN_ENV = os.getenv("DAYS_TO_RETAIN", "30")
+
+# Alterado padrão de retenção diária para 60 dias (para comportar a comparação de 30 dias anteriores)
+DAYS_TO_RETAIN_ENV = os.getenv("DAYS_TO_RETAIN", "60")
+MONTHS_TO_RETAIN_ENV = os.getenv("MONTHS_TO_RETAIN", "24")
 
 try:
     DAYS_TO_RETAIN = int(DAYS_TO_RETAIN_ENV)
     if DAYS_TO_RETAIN <= 0:
-        DAYS_TO_RETAIN = 30
+        DAYS_TO_RETAIN = 60
 except ValueError:
-    DAYS_TO_RETAIN = 30
+    DAYS_TO_RETAIN = 60
+
+try:
+    MONTHS_TO_RETAIN = int(MONTHS_TO_RETAIN_ENV)
+    if MONTHS_TO_RETAIN <= 0:
+        MONTHS_TO_RETAIN = 24
+except ValueError:
+    MONTHS_TO_RETAIN = 24
 
 s3_client = boto3.client('s3')
 
@@ -39,20 +49,34 @@ def load_consolidated_data(bucket, key):
         response = s3_client.get_object(Bucket=bucket, Key=key)
         content = response['Body'].read().decode('utf-8')
         print(f"Successfully loaded existing consolidated file from s3://{bucket}/{key}")
-        return json.loads(content)
+        data = json.loads(content)
+        
+        # --- Compatibilidade e Migração Retroativa ---
+        if "costs_by_tag_and_date" in data:
+            print("Migrating deprecated 'costs_by_tag_and_date' structure to split layout.")
+            data["daily_costs"] = data.pop("costs_by_tag_and_date")
+            
+        if "daily_costs" not in data:
+            data["daily_costs"] = {}
+        if "monthly_costs" not in data:
+            data["monthly_costs"] = {}
+            
+        return data
     except s3_client.exceptions.NoSuchKey:
         print(f"Consolidated file not found at s3://{bucket}/{key}. Initializing new structure.")
         return {
             "metadata": {
-                "description": f"Daily costs aggregated by tag '{RESOURCE_TAG_KEY}' for the last {DAYS_TO_RETAIN} days.",
+                "description": f"Daily costs (last {DAYS_TO_RETAIN} days) and monthly costs (last {MONTHS_TO_RETAIN} months) aggregated by tag '{RESOURCE_TAG_KEY}'.",
                 "tag_key_used": RESOURCE_TAG_KEY, 
                 "days_retained": DAYS_TO_RETAIN,
+                "months_retained": MONTHS_TO_RETAIN,
                 "last_processed_cur_date": None, 
                 "last_processed_assembly_id": None,
                 "last_updated_timestamp_utc": None, 
                 "currency_code": None 
             },
-            "costs_by_tag_and_date": {} 
+            "daily_costs": {},
+            "monthly_costs": {}
         }
     except Exception as e:
         print(f"ERROR: Failed to load consolidated data from s3://{bucket}/{key}. Error: {e}")
@@ -78,7 +102,6 @@ def read_manifest_file(bucket, key):
         raise
 
 def process_single_csv_file(bucket_name, object_key, fallback_date):
-    """Processa um único arquivo CSV e retorna os custos agregados."""
     daily_costs_by_tag = {}
     currency_code = None
     body = None
@@ -165,6 +188,45 @@ def process_single_csv_file(bucket_name, object_key, fallback_date):
              try: body.close()
              except Exception: pass
 
+def rebuild_monthly_costs(consolidated_data, touched_months):
+    """
+    Sincroniza os custos mensais agregados com base nos dados diários.
+    Garante que não haverá duplicidade ao reprocessar os dados do mês corrente.
+    """
+    daily = consolidated_data.get("daily_costs", {})
+    monthly = consolidated_data.setdefault("monthly_costs", {})
+    
+    for tag_value, dates_dict in daily.items():
+        tag_monthly = monthly.setdefault(tag_value, {})
+        for month_str in touched_months:
+            # Filtra os registros diários pertencentes ao mês afetado
+            month_dates = {d: val for d, val in dates_dict.items() if d.startswith(month_str)}
+            if not month_dates:
+                # Se não existem mais dados diários na janela de retenção de 60 dias,
+                # não sobrescrevemos o histórico do mês consolidado do passado
+                continue
+                
+            total_unblended = Decimal('0.0')
+            products = {}
+            
+            for d_str, day_data in month_dates.items():
+                cost_val = day_data.get("TotalUnblendedCost", "0.0")
+                total_unblended += Decimal(str(cost_val))
+                
+                for prod_code, prod_data in day_data.get("CostsByProduct", {}).items():
+                    prod_entry = products.setdefault(prod_code, {})
+                    for usage_type, cost_str in prod_data.items():
+                        prod_entry[usage_type] = prod_entry.get(usage_type, Decimal('0.0')) + Decimal(str(cost_str))
+            
+            # Atualiza/Insere o mês consolidado com valores normalizados em string
+            tag_monthly[month_str] = {
+                "TotalUnblendedCost": str(total_unblended),
+                "CostsByProduct": {
+                    p: {ut: str(c) for ut, c in ut_dict.items()}
+                    for p, ut_dict in products.items()
+                }
+            }
+
 def lambda_handler(event, context):
     print(f"Lambda execution started. Received event: {json.dumps(event)}")
 
@@ -204,7 +266,6 @@ def lambda_handler(event, context):
         print("WARNING: No report keys to process inside the manifest.")
         return {'statusCode': 200, 'body': 'No report keys found.'}
 
-    # Extrair data de processamento com base no assemblyId
     processing_date_str = None
     match = re.search(r'(\d{8})T\d{6}Z', assembly_id)
     if match:
@@ -213,29 +274,29 @@ def lambda_handler(event, context):
         except ValueError:
             pass
 
-    # 2. Processar e mesclar em lote os arquivos csv descritos no manifesto
+    # 2. Processar e agrupar novos dados diários em lote
     temp_aggregated_costs = {}
     final_currency_code = None
+    touched_months = set()
 
     for csv_key in report_keys:
         csv_costs, csv_currency = process_single_csv_file(cur_bucket_name, csv_key, processing_date_str)
         if csv_currency:
             final_currency_code = csv_currency
 
-        # Mesclar custos desse arquivo no dicionário temporário do lote
+        # Mesclar no lote temporário
         for tag, dates_dict in csv_costs.items():
             if tag not in temp_aggregated_costs:
                 temp_aggregated_costs[tag] = {}
             for d_str, day_data in dates_dict.items():
+                touched_months.add(d_str[:7]) # Captura formato YYYY-MM
                 if d_str not in temp_aggregated_costs[tag]:
                     temp_aggregated_costs[tag][d_str] = day_data
                 else:
-                    # Somar TotalUnblendedCost
                     existing_total = temp_aggregated_costs[tag][d_str]["TotalUnblendedCost"]
                     new_total = day_data["TotalUnblendedCost"]
                     temp_aggregated_costs[tag][d_str]["TotalUnblendedCost"] = existing_total + new_total
                     
-                    # Mesclar CostsByProduct
                     for prod_code, prod_data in day_data["CostsByProduct"].items():
                         if prod_code not in temp_aggregated_costs[tag][d_str]["CostsByProduct"]:
                             temp_aggregated_costs[tag][d_str]["CostsByProduct"][prod_code] = prod_data
@@ -247,32 +308,29 @@ def lambda_handler(event, context):
     # Serializar decimais temporários para float/string
     daily_costs_data = json.loads(json.dumps(temp_aggregated_costs, default=decimal_default))
 
-    # 3. Carregar Dados Consolidados Existentes do S3
+    # 3. Carregar dados consolidados existentes do S3
     try:
         consolidated_data = load_consolidated_data(consolidated_bucket, CONSOLIDATED_KEY)
     except Exception as e:
         return {'statusCode': 500, 'body': f'Failed to load consolidated data: {str(e)}'}
 
-    costs_main_key = 'costs_by_tag_and_date'
-    if costs_main_key not in consolidated_data or not isinstance(consolidated_data[costs_main_key], dict):
-        consolidated_data[costs_main_key] = {}
-
-    # 4. Mesclar os dados do novo lote com a consolidação histórica
-    # Como todos os splits do assembly atual já foram somados em memória no "daily_costs_data",
-    # nós podemos atualizar diretamente as datas do relatório consolidado com a certeza de que estão completas.
+    # 4. Mesclar novos dados na estrutura "daily_costs"
+    daily_key = 'daily_costs'
     updated_tags_count = 0
     for tag_value, dates_dict in daily_costs_data.items():
-        if tag_value not in consolidated_data[costs_main_key]:
-            consolidated_data[costs_main_key][tag_value] = {}
+        if tag_value not in consolidated_data[daily_key]:
+            consolidated_data[daily_key][tag_value] = {}
         for date_str, day_data in dates_dict.items():
-            consolidated_data[costs_main_key][tag_value][date_str] = day_data
+            consolidated_data[daily_key][tag_value][date_str] = day_data
         updated_tags_count += 1
 
-    print(f"Merged updated date metrics for {updated_tags_count} tags.")
+    # 5. Sincronizar custos agregados mensais dos meses afetados
+    rebuild_monthly_costs(consolidated_data, touched_months)
+    print(f"Rebuilt monthly consolidated buckets for months: {list(touched_months)}")
 
-    # 5. Obter a data mais recente no consolidado para balizar o descarte (evita limpar testes antigos)
+    # 6. Obter data mais recente do dataset para determinar corte das podas
     all_dates = []
-    for tag_val, dates_dict in consolidated_data[costs_main_key].items():
+    for tag_val, dates_dict in consolidated_data[daily_key].items():
         for d_str in dates_dict.keys():
             try:
                 all_dates.append(datetime.strptime(d_str, '%Y-%m-%d').date())
@@ -281,20 +339,20 @@ def lambda_handler(event, context):
 
     if all_dates:
         reference_date = max(all_dates)
-        print(f"Using latest date found in dataset as reference for retention: {reference_date}")
+        print(f"Reference date determined for pruning: {reference_date}")
     else:
         reference_date = datetime.now(timezone.utc).date()
-        print(f"Using current date as reference for retention: {reference_date}")
+        print(f"Reference date falling back to current date: {reference_date}")
 
-    # Remover (Podar) Dados Antigos
-    print(f"Starting pruning of data older than {DAYS_TO_RETAIN} days...")
+    # 7. Podar dados diários antigos (Mais velhos que 60 dias)
+    print(f"Starting pruning of daily data older than {DAYS_TO_RETAIN} days...")
     cutoff_date = reference_date - timedelta(days=DAYS_TO_RETAIN)
     dates_removed_count = 0
-    empty_tags_after_pruning = []
+    empty_daily_tags = []
 
-    for tag_value in list(consolidated_data[costs_main_key].keys()):
+    for tag_value in list(consolidated_data[daily_key].keys()):
         dates_to_delete = []
-        tag_date_data = consolidated_data[costs_main_key][tag_value]
+        tag_date_data = consolidated_data[daily_key][tag_value]
         
         for date_str in tag_date_data.keys():
             try:
@@ -305,24 +363,55 @@ def lambda_handler(event, context):
                 continue
                 
         for date_to_delete in dates_to_delete:
-            del consolidated_data[costs_main_key][tag_value][date_to_delete]
+            del consolidated_data[daily_key][tag_value][date_to_delete]
             dates_removed_count += 1
                 
-        if not consolidated_data[costs_main_key][tag_value]:
-            empty_tags_after_pruning.append(tag_value)
+        if not consolidated_data[daily_key][tag_value]:
+            empty_daily_tags.append(tag_value)
 
-    for tag_to_delete in empty_tags_after_pruning:
-        del consolidated_data[costs_main_key][tag_to_delete]
+    for tag_to_delete in empty_daily_tags:
+        del consolidated_data[daily_key][tag_to_delete]
 
-    # Atualizar Metadados
+    # 8. Podar dados mensais consolidados antigos (Mais velhos que 24 meses)
+    monthly_key = 'monthly_costs'
+    months_removed_count = 0
+    
+    # Calcular limite de corte de 24 meses atrás baseado na referência
+    ref_year = reference_date.year
+    ref_month = reference_date.month
+    cutoff_year = ref_year - (MONTHS_TO_RETAIN // 12)
+    cutoff_month = ref_month - (MONTHS_TO_RETAIN % 12)
+    if cutoff_month <= 0:
+        cutoff_month += 12
+        cutoff_year -= 1
+    cutoff_month_str = f"{cutoff_year:04d}-{cutoff_month:02d}"
+
+    print(f"Starting pruning of monthly aggregates older than {cutoff_month_str}...")
+
+    if monthly_key in consolidated_data:
+        for tag_value in list(consolidated_data[monthly_key].keys()):
+            months_to_delete = []
+            for m_str in consolidated_data[monthly_key][tag_value].keys():
+                if m_str < cutoff_month_str:
+                    months_to_delete.append(m_str)
+            
+            for m_to_delete in months_to_delete:
+                del consolidated_data[monthly_key][tag_value][m_to_delete]
+                months_removed_count += 1
+                
+            if not consolidated_data[monthly_key][tag_value]:
+                del consolidated_data[monthly_key][tag_value]
+
+    # Atualizar Metadados Globais do JSON
     consolidated_data['metadata']['last_processed_cur_date'] = processing_date_str
     consolidated_data['metadata']['last_processed_assembly_id'] = assembly_id
     consolidated_data['metadata']['last_updated_timestamp_utc'] = datetime.now(timezone.utc).isoformat(timespec='seconds') + 'Z'
     consolidated_data['metadata']['days_retained'] = DAYS_TO_RETAIN
+    consolidated_data['metadata']['months_retained'] = MONTHS_TO_RETAIN
     if final_currency_code:
         consolidated_data['metadata']['currency_code'] = final_currency_code
 
-    # Salvar o JSON Consolidado Atualizado
+    # Salvar o JSON Consolidado Final
     try:
         save_consolidated_data(consolidated_bucket, CONSOLIDATED_KEY, consolidated_data)
     except Exception as e:
@@ -331,8 +420,9 @@ def lambda_handler(event, context):
     return {
         'statusCode': 200,
         'body': json.dumps({
-            'message': 'Consolidated cost data updated successfully from manifest.',
+            'message': 'Consolidated cost data updated successfully.',
             'tags_updated': updated_tags_count,
-            'old_dates_removed': dates_removed_count
+            'daily_dates_removed': dates_removed_count,
+            'monthly_records_removed': months_removed_count
         })
     }
