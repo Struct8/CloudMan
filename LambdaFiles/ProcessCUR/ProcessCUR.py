@@ -6,7 +6,7 @@ import os
 import gzip
 import re
 import urllib.parse
-from decimal import Decimal, getcontext, InvalidOperation
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
 
 # --- Constantes e Configuração ---
@@ -14,7 +14,7 @@ RESOURCE_TAG_KEY = os.environ.get('RESOURCE_TAG_KEY', 'resourceTags/user:Name')
 COST_COLUMN = 'lineItem/UnblendedCost'
 PRODUCT_COLUMN = 'lineItem/ProductCode'
 USAGE_TYPE_COLUMN = 'lineItem/UsageType'
-USAGE_START_DATE_COLUMN = 'lineItem/UsageStartDate'  # Nova coluna para identificar o dia real do custo
+USAGE_START_DATE_COLUMN = 'lineItem/UsageStartDate'
 
 CUR_BUCKET_NAME_FALLBACK = os.environ.get('AWS_S3_BUCKET_NAME_0') or os.environ.get('AWS_S3_BUCKET_TARGET_NAME_0')
 CONSOLIDATED_BUCKET_NAME = os.environ.get('AWS_S3_BUCKET_TARGET_NAME_0') or CUR_BUCKET_NAME_FALLBACK
@@ -45,9 +45,15 @@ def load_consolidated_data(bucket, key):
         return {
             "metadata": {
                 "description": f"Daily costs aggregated by tag '{RESOURCE_TAG_KEY}' for the last {DAYS_TO_RETAIN} days.",
-                "tag_key_used": RESOURCE_TAG_KEY, "days_retained": DAYS_TO_RETAIN,
-                "last_processed_cur_date": None, "last_updated_timestamp_utc": None, "currency_code": None },
-            "costs_by_tag_and_date": {} }
+                "tag_key_used": RESOURCE_TAG_KEY, 
+                "days_retained": DAYS_TO_RETAIN,
+                "last_processed_cur_date": None, 
+                "last_processed_assembly_id": None,
+                "last_updated_timestamp_utc": None, 
+                "currency_code": None 
+            },
+            "costs_by_tag_and_date": {} 
+        }
     except Exception as e:
         print(f"ERROR: Failed to load consolidated data from s3://{bucket}/{key}. Error: {e}")
         raise
@@ -61,29 +67,25 @@ def save_consolidated_data(bucket, key, data):
         print(f"ERROR: Failed to save consolidated data to s3://{bucket}/{key}. Error: {e}")
         raise
 
-def process_cur_file(bucket_name, object_key):
-    print("process_cur_file object_key:", object_key)
-    
-    if not (object_key.lower().endswith('.csv') or object_key.lower().endswith('.csv.gz')):
-        print(f"Skipping non-data file (manifest or metadata): {object_key}")
-        return None, {}, None
+def read_manifest_file(bucket, key):
+    try:
+        print(f"Reading manifest file: s3://{bucket}/{key}")
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        content = response['Body'].read().decode('utf-8')
+        return json.loads(content)
+    except Exception as e:
+        print(f"ERROR: Failed to read manifest file: {e}")
+        raise
 
+def process_single_csv_file(bucket_name, object_key, fallback_date):
+    """Processa um único arquivo CSV e retorna os custos agregados."""
     daily_costs_by_tag = {}
-    processing_date_str = None
     currency_code = None
     body = None
     text_stream = None
     
-    print(f"Attempting to process CUR file: s3://{bucket_name}/{object_key}")
+    print(f"Processing data part: s3://{bucket_name}/{object_key}")
     
-    # Extração de segurança do nome do arquivo para fallback de data
-    match = re.search(r'(\d{8})T\d{6}Z', object_key)
-    if match:
-        try:
-            processing_date_str = datetime.strptime(match.group(1), '%Y%m%d').strftime('%Y-%m-%d')
-        except ValueError:
-            pass
-
     try:
         s3_object = s3_client.get_object(Bucket=bucket_name, Key=object_key)
         body = s3_object['Body']
@@ -108,12 +110,11 @@ def process_cur_file(bucket_name, object_key):
                     currency_code = currency_code_found
                     currency_found = True
 
-            # Obter a data real do registro de uso (ex: '2026-06-15T00:00:00Z')
             raw_usage_date = row.get(USAGE_START_DATE_COLUMN)
             if raw_usage_date and len(raw_usage_date) >= 10:
-                usage_date = raw_usage_date[:10]  # Obtém 'YYYY-MM-DD'
+                usage_date = raw_usage_date[:10]
             else:
-                usage_date = processing_date_str or "UnknownDate"
+                usage_date = fallback_date or "UnknownDate"
 
             tag_value = row.get(RESOURCE_TAG_KEY)
             if not tag_value: 
@@ -131,7 +132,6 @@ def process_cur_file(bucket_name, object_key):
             product_code = row.get(PRODUCT_COLUMN) or 'UnknownProduct'
             usage_type = row.get(USAGE_TYPE_COLUMN) or 'UnknownUsageType'
             
-            # Estrutura aninhada: daily_costs_by_tag[tag_value][usage_date]
             if tag_value not in daily_costs_by_tag:
                 daily_costs_by_tag[tag_value] = {}
             
@@ -151,14 +151,12 @@ def process_cur_file(bucket_name, object_key):
                 costs_by_usage[usage_type] = Decimal('0.0')
             costs_by_usage[usage_type] += cost
 
-        print(f"Finished processing CUR file content. Total rows scanned: {processed_rows}.")
-
-        final_daily_costs_dict = json.loads(json.dumps(daily_costs_by_tag, default=decimal_default))
-        return processing_date_str, final_daily_costs_dict, currency_code
+        print(f"Finished parsing part. Total rows scanned: {processed_rows}.")
+        return daily_costs_by_tag, currency_code
 
     except Exception as e:
-        print(f"Error processing CUR file content: {e}")
-        return None, {}, None
+        print(f"Error parsing file part {object_key}: {e}")
+        return {}, None
     finally:
         if text_stream and not text_stream.closed:
             try: text_stream.close()
@@ -170,16 +168,16 @@ def process_cur_file(bucket_name, object_key):
 def lambda_handler(event, context):
     print(f"Lambda execution started. Received event: {json.dumps(event)}")
 
-    cur_object_key = None
+    manifest_key = None
     cur_bucket_name = None
 
     try:
         if 'Records' in event and isinstance(event['Records'], list) and event['Records'] and 's3' in event['Records'][0]:
             s3_event = event['Records'][0]['s3']
             cur_bucket_name = s3_event['bucket']['name']
-            cur_object_key = urllib.parse.unquote_plus(s3_event['object']['key'], encoding='utf-8')
+            manifest_key = urllib.parse.unquote_plus(s3_event['object']['key'], encoding='utf-8')
         elif isinstance(event, dict) and 'object_key' in event:
-            cur_object_key = event['object_key']
+            manifest_key = event['object_key']
             if CUR_BUCKET_NAME_FALLBACK:
                 cur_bucket_name = CUR_BUCKET_NAME_FALLBACK
             else:
@@ -193,18 +191,65 @@ def lambda_handler(event, context):
     if not consolidated_bucket:
         return {'statusCode': 500, 'body': 'Configuration Error: Target bucket env var missing.'}
 
-    consolidated_key = CONSOLIDATED_KEY
-
-    # Processar o Arquivo CUR de Entrada
-    processing_date_str, daily_costs_data, currency_code = process_cur_file(cur_bucket_name, cur_object_key)
-
-    if not processing_date_str or not daily_costs_data:
-        print("INFO: CUR file bypassed or processed with no data.")
-        return {'statusCode': 200, 'body': 'Skipped or no data processed.'}
-
-    # Carregar Dados Consolidados Existentes
+    # 1. Carregar arquivo de Manifesto (.json)
     try:
-        consolidated_data = load_consolidated_data(consolidated_bucket, consolidated_key)
+        manifest = read_manifest_file(cur_bucket_name, manifest_key)
+    except Exception as e:
+        return {'statusCode': 500, 'body': f'Failed to parse manifest: {str(e)}'}
+
+    assembly_id = manifest.get("assemblyId", "UnknownAssembly")
+    report_keys = manifest.get("reportKeys", [])
+
+    if not report_keys:
+        print("WARNING: No report keys to process inside the manifest.")
+        return {'statusCode': 200, 'body': 'No report keys found.'}
+
+    # Extrair data de processamento com base no assemblyId
+    processing_date_str = None
+    match = re.search(r'(\d{8})T\d{6}Z', assembly_id)
+    if match:
+        try:
+            processing_date_str = datetime.strptime(match.group(1), '%Y%m%d').strftime('%Y-%m-%d')
+        except ValueError:
+            pass
+
+    # 2. Processar e mesclar em lote os arquivos csv descritos no manifesto
+    temp_aggregated_costs = {}
+    final_currency_code = None
+
+    for csv_key in report_keys:
+        csv_costs, csv_currency = process_single_csv_file(cur_bucket_name, csv_key, processing_date_str)
+        if csv_currency:
+            final_currency_code = csv_currency
+
+        # Mesclar custos desse arquivo no dicionário temporário do lote
+        for tag, dates_dict in csv_costs.items():
+            if tag not in temp_aggregated_costs:
+                temp_aggregated_costs[tag] = {}
+            for d_str, day_data in dates_dict.items():
+                if d_str not in temp_aggregated_costs[tag]:
+                    temp_aggregated_costs[tag][d_str] = day_data
+                else:
+                    # Somar TotalUnblendedCost
+                    existing_total = temp_aggregated_costs[tag][d_str]["TotalUnblendedCost"]
+                    new_total = day_data["TotalUnblendedCost"]
+                    temp_aggregated_costs[tag][d_str]["TotalUnblendedCost"] = existing_total + new_total
+                    
+                    # Mesclar CostsByProduct
+                    for prod_code, prod_data in day_data["CostsByProduct"].items():
+                        if prod_code not in temp_aggregated_costs[tag][d_str]["CostsByProduct"]:
+                            temp_aggregated_costs[tag][d_str]["CostsByProduct"][prod_code] = prod_data
+                        else:
+                            for usage_type, cost_val in prod_data.items():
+                                existing_val = temp_aggregated_costs[tag][d_str]["CostsByProduct"][prod_code].get(usage_type, Decimal('0.0'))
+                                temp_aggregated_costs[tag][d_str]["CostsByProduct"][prod_code][usage_type] = existing_val + cost_val
+
+    # Serializar decimais temporários para float/string
+    daily_costs_data = json.loads(json.dumps(temp_aggregated_costs, default=decimal_default))
+
+    # 3. Carregar Dados Consolidados Existentes do S3
+    try:
+        consolidated_data = load_consolidated_data(consolidated_bucket, CONSOLIDATED_KEY)
     except Exception as e:
         return {'statusCode': 500, 'body': f'Failed to load consolidated data: {str(e)}'}
 
@@ -212,21 +257,38 @@ def lambda_handler(event, context):
     if costs_main_key not in consolidated_data or not isinstance(consolidated_data[costs_main_key], dict):
         consolidated_data[costs_main_key] = {}
 
-    # Mesclar dados de múltiplos dias de uso atualizados
+    # 4. Mesclar os dados do novo lote com a consolidação histórica
+    # Como todos os splits do assembly atual já foram somados em memória no "daily_costs_data",
+    # nós podemos atualizar diretamente as datas do relatório consolidado com a certeza de que estão completas.
     updated_tags_count = 0
     for tag_value, dates_dict in daily_costs_data.items():
         if tag_value not in consolidated_data[costs_main_key]:
             consolidated_data[costs_main_key][tag_value] = {}
         for date_str, day_data in dates_dict.items():
-            # Atualiza ou insere o custo do dia específico
             consolidated_data[costs_main_key][tag_value][date_str] = day_data
         updated_tags_count += 1
 
     print(f"Merged updated date metrics for {updated_tags_count} tags.")
 
+    # 5. Obter a data mais recente no consolidado para balizar o descarte (evita limpar testes antigos)
+    all_dates = []
+    for tag_val, dates_dict in consolidated_data[costs_main_key].items():
+        for d_str in dates_dict.keys():
+            try:
+                all_dates.append(datetime.strptime(d_str, '%Y-%m-%d').date())
+            except ValueError:
+                continue
+
+    if all_dates:
+        reference_date = max(all_dates)
+        print(f"Using latest date found in dataset as reference for retention: {reference_date}")
+    else:
+        reference_date = datetime.now(timezone.utc).date()
+        print(f"Using current date as reference for retention: {reference_date}")
+
     # Remover (Podar) Dados Antigos
     print(f"Starting pruning of data older than {DAYS_TO_RETAIN} days...")
-    cutoff_date = datetime.now(timezone.utc).date() - timedelta(days=DAYS_TO_RETAIN)
+    cutoff_date = reference_date - timedelta(days=DAYS_TO_RETAIN)
     dates_removed_count = 0
     empty_tags_after_pruning = []
 
@@ -254,21 +316,22 @@ def lambda_handler(event, context):
 
     # Atualizar Metadados
     consolidated_data['metadata']['last_processed_cur_date'] = processing_date_str
+    consolidated_data['metadata']['last_processed_assembly_id'] = assembly_id
     consolidated_data['metadata']['last_updated_timestamp_utc'] = datetime.now(timezone.utc).isoformat(timespec='seconds') + 'Z'
     consolidated_data['metadata']['days_retained'] = DAYS_TO_RETAIN
-    if currency_code:
-        consolidated_data['metadata']['currency_code'] = currency_code
+    if final_currency_code:
+        consolidated_data['metadata']['currency_code'] = final_currency_code
 
     # Salvar o JSON Consolidado Atualizado
     try:
-        save_consolidated_data(consolidated_bucket, consolidated_key, consolidated_data)
+        save_consolidated_data(consolidated_bucket, CONSOLIDATED_KEY, consolidated_data)
     except Exception as e:
         return {'statusCode': 500, 'body': f'Failed to save: {str(e)}'}
 
     return {
         'statusCode': 200,
         'body': json.dumps({
-            'message': 'Consolidated cost data updated successfully.',
+            'message': 'Consolidated cost data updated successfully from manifest.',
             'tags_updated': updated_tags_count,
             'old_dates_removed': dates_removed_count
         })
