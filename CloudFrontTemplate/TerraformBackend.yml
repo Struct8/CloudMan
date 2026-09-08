@@ -82,11 +82,27 @@ Parameters:
     Default: "false"
     AllowedValues: ["true", "false"]
 
+  SubjectRepoSegment:
+    Description: >-
+      The repository part of the OIDC subject, as GitHub reports it for this
+      repository. Empty means it is built from GitHubOrg and GitHubRepo, which is
+      the form GitHub issues for a repository created before 15 July 2026. A
+      repository created after that date, and one renamed or transferred after it,
+      carries the immutable identifier of the organization and of the repository
+      as well, and those identifiers cannot be removed from the subject. Example:
+      Struct8@276103125/Import@1360758768. Important: a subject built from names
+      alone never matches the token of such a repository, and the role then
+      refuses every run. Struct8 fills this in from GitHub when it prepares the
+      backend.
+    Type: String
+    Default: ""
+
 Conditions:
   ShouldCreateS3: !Equals [ !Ref CreateS3Bucket, "true" ]
   ShouldCreateDynamoDB: !Equals [ !Ref CreateDynamoDBTable, "true" ]
   ShouldCreateOIDC: !Equals [ !Ref CreateOIDCProvider, "true" ]
   ShouldRequireEngineWorkflow: !Equals [ !Ref RequireEngineWorkflow, "true" ]
+  HasSubjectRepoSegment: !Not [ !Equals [ !Ref SubjectRepoSegment, "" ] ]
 
 Resources:
   # 1. OIDC Provider (Optional)
@@ -192,12 +208,24 @@ Resources:
                   token.actions.githubusercontent.com:aud: "sts.amazonaws.com"
                 StringEqualsIgnoreCase:
                   token.actions.githubusercontent.com:sub:
-                    - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/engine.yml@refs/heads/devlocal"
-                    - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/engine.yml@refs/heads/dev"
-                    - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/engine.yml@refs/heads/test"
-                    - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/engine.yml@refs/heads/alpha"
-                    - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/engine.yml@refs/heads/main"
-                    - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/lambda-sync.yml@refs/heads/main"
+                    - !Sub
+                      - "repo:${RepoSeg}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/engine.yml@refs/heads/devlocal"
+                      - RepoSeg: !If [ HasSubjectRepoSegment, !Ref SubjectRepoSegment, !Sub "${GitHubOrg}/${GitHubRepo}" ]
+                    - !Sub
+                      - "repo:${RepoSeg}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/engine.yml@refs/heads/dev"
+                      - RepoSeg: !If [ HasSubjectRepoSegment, !Ref SubjectRepoSegment, !Sub "${GitHubOrg}/${GitHubRepo}" ]
+                    - !Sub
+                      - "repo:${RepoSeg}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/engine.yml@refs/heads/test"
+                      - RepoSeg: !If [ HasSubjectRepoSegment, !Ref SubjectRepoSegment, !Sub "${GitHubOrg}/${GitHubRepo}" ]
+                    - !Sub
+                      - "repo:${RepoSeg}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/engine.yml@refs/heads/alpha"
+                      - RepoSeg: !If [ HasSubjectRepoSegment, !Ref SubjectRepoSegment, !Sub "${GitHubOrg}/${GitHubRepo}" ]
+                    - !Sub
+                      - "repo:${RepoSeg}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/engine.yml@refs/heads/main"
+                      - RepoSeg: !If [ HasSubjectRepoSegment, !Ref SubjectRepoSegment, !Sub "${GitHubOrg}/${GitHubRepo}" ]
+                    - !Sub
+                      - "repo:${RepoSeg}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/lambda-sync.yml@refs/heads/main"
+                      - RepoSeg: !If [ HasSubjectRepoSegment, !Ref SubjectRepoSegment, !Sub "${GitHubOrg}/${GitHubRepo}" ]
               # Flag off: any workflow on the ref -- and in BOTH spellings of the
               # subject. Once the repository's subject template includes
               # job_workflow_ref (the app sets it when it prepares a backend),
@@ -209,8 +237,12 @@ Resources:
                   token.actions.githubusercontent.com:aud: "sts.amazonaws.com"
                 StringLike:
                   token.actions.githubusercontent.com:sub:
-                    - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}"
-                    - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}:job_workflow_ref:*"
+                    - !Sub
+                      - "repo:${RepoSeg}:${GitHubSubject}"
+                      - RepoSeg: !If [ HasSubjectRepoSegment, !Ref SubjectRepoSegment, !Sub "${GitHubOrg}/${GitHubRepo}" ]
+                    - !Sub
+                      - "repo:${RepoSeg}:${GitHubSubject}:job_workflow_ref:*"
+                      - RepoSeg: !If [ HasSubjectRepoSegment, !Ref SubjectRepoSegment, !Sub "${GitHubOrg}/${GitHubRepo}" ]
       Policies:
         # Explicit Deny beats the Allow in AdministratorAccess. Scoped to the two
         # objects that ARE this role's own trust, plus audit tampering -- everything
@@ -269,8 +301,12 @@ Outputs:
     Description: "The GitHub Actions subject(s) that can use this role"
     Value: !If
       - ShouldRequireEngineWorkflow
-      - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/{engine.yml@refs/heads/<devlocal|dev|test|alpha|main> | lambda-sync.yml@refs/heads/main}"
-      - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}"
+      - !Sub
+        - "repo:${RepoSeg}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/{engine.yml@refs/heads/<devlocal|dev|test|alpha|main> | lambda-sync.yml@refs/heads/main}"
+        - RepoSeg: !If [ HasSubjectRepoSegment, !Ref SubjectRepoSegment, !Sub "${GitHubOrg}/${GitHubRepo}" ]
+      - !Sub
+        - "repo:${RepoSeg}:${GitHubSubject}"
+        - RepoSeg: !If [ HasSubjectRepoSegment, !Ref SubjectRepoSegment, !Sub "${GitHubOrg}/${GitHubRepo}" ]
 
   BucketName:
     Condition: ShouldCreateS3
