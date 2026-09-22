@@ -19,6 +19,7 @@ compressing anything. Signing uses botocore, which the runtime already carries.
 """
 
 import gzip
+import hashlib
 import io
 import ipaddress
 import json
@@ -497,7 +498,41 @@ def cut_to_top_n(totals):
     return kept
 
 
-def to_series(totals, diagnostics):
+def write_offset_ms(keys):
+    """Where inside the bucket this invocation writes, derived from what it read.
+
+    WHY A SAMPLE IS NOT WRITTEN AT THE BUCKET'S OWN INSTANT. AWS splits one
+    capture window across more than one object, and under the S3 notification
+    each object is a separate invocation holding only its part of that minute.
+    Both writing at the bucket instant means two different values at the same
+    instant on the same series, which Prometheus refuses -- and it refuses the
+    whole request, so the other series go with it. Measured on 2026-09-22, ten
+    minutes into the first run and with a single network interface: bucket
+    1790117040 arrived as 2778 bytes in one object and 1401 in another.
+
+    Offset inside the minute, the two become samples of the same series at
+    DIFFERENT instants, which is legal, and `sum_over_time` over the window adds
+    them back to 4179. That costs nothing on the read side: the series is sparse,
+    so the query was already a range query summing the window, never an instant
+    query.
+
+    IT COMES FROM THE KEYS AND NOT FROM THE CLOCK, so a retry of the same objects
+    writes the same instant with the same value -- and a repeated sample whose
+    value matches is accepted, which makes the retry free instead of fatal.
+
+    `hash()` cannot be used: Python randomises it per process, so the same object
+    would land on a different instant after every cold start, and the retry would
+    stop being idempotent.
+
+    WHAT IT DOES NOT FIX: the top-N cut still runs per invocation, so a pair kept
+    in one object and cut in another leaves the minute undercounted, silently.
+    Only a writer that sees the whole minute fixes that one.
+    """
+    digest = hashlib.sha256('\n'.join(sorted(keys)).encode('utf-8')).digest()
+    return int.from_bytes(digest[:4], 'big') % (BUCKET_SECONDS * 1000)
+
+
+def to_series(totals, diagnostics, offset_ms=0):
     """One Prometheus series per (labels, metric), samples ordered by instant."""
     grouped = defaultdict(list)
     now = int(time.time())
@@ -507,7 +542,7 @@ def to_series(totals, diagnostics):
         if bucket > closed_before:
             diagnostics['buckets_still_open'] += 1
             continue
-        timestamp_ms = bucket * 1000
+        timestamp_ms = bucket * 1000 + offset_ms
         grouped[(labels, METRIC_BYTES)].append((timestamp_ms, byte_count))
         grouped[(labels, METRIC_PACKETS)].append((timestamp_ms, packet_count))
 
@@ -623,19 +658,27 @@ def lambda_handler(event, context):
     print('Known CIDRs: ' + str([str(network) for network, _ in cidrs]))
 
     records = []
+    read_keys = []
     now = int(time.time())
     for key in keys:
         try:
             from_this_file = list(read_text_object(bucket, key))
             records.extend(from_this_file)
+            read_keys.append(key)
             diagnostics['files_processed'] += 1
             report_delivery_delay(key, from_this_file, now)
         except Exception as error:  # noqa: BLE001 -- one bad file must not stop the run
             diagnostics['files_skipped'] += 1
             print('Skipped ' + key + ': ' + str(error))
 
+    # Only the keys actually READ decide the offset. A file that failed is not
+    # part of what this invocation is writing, and leaving it out keeps the
+    # retry -- which would fail on it again -- landing on the same instant.
+    offset_ms = write_offset_ms(read_keys)
+    print('write offset: ' + str(offset_ms) + ' ms into each bucket')
+
     totals = cut_to_top_n(accumulate(records, cidrs, diagnostics))
-    edge_series = to_series(totals, diagnostics)
+    edge_series = to_series(totals, diagnostics, offset_ms)
 
     if not edge_series:
         print('Nothing to write. Diagnostics: ' + json.dumps(dict(diagnostics)))

@@ -367,5 +367,55 @@ check('a 5xx is re-raised instead: there the bytes are fine and a retry helps',
       reraised)
 
 
+print('\n=== the write offset, which is what lets two objects share a minute ===')
+
+# The two real objects of 2026-09-22, the ones that collided on bucket 1790117040.
+PREFIX = ('AWSLogs/952133486861/vpcflowlogs/us-east-1/2026/09/22/'
+          '952133486861_vpcflowlogs_us-east-1_fl-0296d8224cd28bf60_')
+KEY_A = PREFIX + '20260922T2240Z_55b632a6.log.gz'
+KEY_B = PREFIX + '20260922T2245Z_304f4c51.log.gz'
+
+offset_a = pfl.write_offset_ms([KEY_A])
+offset_b = pfl.write_offset_ms([KEY_B])
+
+check('the offset stays inside its own bucket',
+      0 <= offset_a < pfl.BUCKET_SECONDS * 1000
+      and 0 <= offset_b < pfl.BUCKET_SECONDS * 1000, str((offset_a, offset_b)))
+check('two objects of one delivery land on different instants',
+      offset_a != offset_b, str((offset_a, offset_b)))
+check('the same objects always land on the same instant, so a retry is idempotent',
+      pfl.write_offset_ms([KEY_A]) == offset_a)
+check('the order the keys arrive in does not move the instant',
+      pfl.write_offset_ms([KEY_A, KEY_B]) == pfl.write_offset_ms([KEY_B, KEY_A]))
+
+# Hard-coded on purpose. Python randomises hash() per process, so swapping the
+# digest for hash() would move these numbers on every cold start -- the object
+# would land somewhere new each time and the retry would stop being idempotent.
+# A literal is what makes that swap fail here instead of in production.
+check('the offset is the same in every process, not Python hash()',
+      (offset_a, offset_b) == (43161, 6978), str((offset_a, offset_b)))
+
+# The measured case, rebuilt: one bucket, one pair, two objects, 2778 and 1401.
+BUCKET = 1790117040
+PAIR = (('src_id', 'i-0abc'), ('dst_id', 'internet'))
+sample_a = [s for labels, s in pfl.to_series({(BUCKET, PAIR): [2778, 29]},
+                                             defaultdict(int), offset_a)
+            if labels['__name__'] == pfl.METRIC_BYTES][0][0]
+sample_b = [s for labels, s in pfl.to_series({(BUCKET, PAIR): [1401, 13]},
+                                             defaultdict(int), offset_b)
+            if labels['__name__'] == pfl.METRIC_BYTES][0][0]
+
+check('the two writes fall in the SAME minute',
+      sample_a[0] // 60000 == sample_b[0] // 60000 == BUCKET * 1000 // 60000,
+      str((sample_a[0], sample_b[0])))
+check('at DIFFERENT instants, which is what Prometheus accepts',
+      sample_a[0] != sample_b[0], str((sample_a[0], sample_b[0])))
+check('and the window sums back to what the minute really carried',
+      sample_a[1] + sample_b[1] == 4179, str(sample_a[1] + sample_b[1]))
+check('with no offset the two would land on the same instant -- the 400',
+      pfl.to_series({(BUCKET, PAIR): [2778, 29]}, defaultdict(int))[0][1][0][0]
+      == pfl.to_series({(BUCKET, PAIR): [1401, 13]}, defaultdict(int))[0][1][0][0])
+
+
 print('\n' + ('all checks passed' if not failures else 'FAILED: ' + ', '.join(failures)))
 sys.exit(1 if failures else 0)
