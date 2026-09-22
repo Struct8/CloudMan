@@ -46,10 +46,21 @@ WORKSPACE_ENDPOINT = (
     or os.environ.get('PROMETHEUS_ENDPOINT', '')
 )
 
+# `FLOW_LOG_BUCKET` comes FIRST, and the order is the point. A wire writes
+# <TYPE>_NAME_<LABEL> holding the target's LOGICAL NAME -- the label on the canvas
+# -- while a bucket whose namespace is account-regional is called
+# `<logical>-<account>-<region>-an` in the cloud. Taking the wire's value as a
+# bucket name asks S3 for a bucket that does not exist, and the two agree only
+# when the bucket has no namespace. The endpoint above does not share the
+# problem: the workspace declares `prometheus_endpoint` in its `exportEnvVar`, so
+# what arrives there is the real address.
+#
+# The diagram therefore writes this one by hand, carrying a Terraform reference
+# (`aws_s3_bucket.<label>.id`). The wire-built names stay as the fallback.
 FLOW_BUCKET_NAME = (
-    os.environ.get('AWS_S3_BUCKET_NAME_0')
-    or os.environ.get('AWS_S3_BUCKET_TARGET_NAME_0')
-    or os.environ.get('FLOW_LOG_BUCKET', '')
+    os.environ.get('FLOW_LOG_BUCKET')
+    or os.environ.get('AWS_S3_BUCKET_NAME_0')
+    or os.environ.get('AWS_S3_BUCKET_TARGET_NAME_0', '')
 )
 
 REGION = os.environ.get('AWS_REGION', 'us-east-1')
@@ -256,6 +267,15 @@ def known_cidrs():
         for vpc in page.get('Vpcs', []):
             for association in vpc.get('CidrBlockAssociationSet', []):
                 block = association.get('CidrBlock')
+                if block:
+                    blocks.append((ipaddress.ip_network(block), vpc['VpcId']))
+            # A dual-stack VPC keeps its IPv6 ranges in a SEPARATE list, and
+            # leaving it out is the kind of gap that never looks like one: every
+            # IPv6 address then falls outside every known CIDR, so name_endpoint
+            # collapses the whole v6 half of the traffic to `internet` and the
+            # picture reads as complete.
+            for association in vpc.get('Ipv6CidrBlockAssociationSet', []):
+                block = association.get('Ipv6CidrBlock')
                 if block:
                     blocks.append((ipaddress.ip_network(block), vpc['VpcId']))
     return blocks
