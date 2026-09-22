@@ -25,6 +25,7 @@ import json
 import os
 import struct
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict
@@ -190,8 +191,25 @@ def snappy_literal_only(data):
 
 # --- remote write -----------------------------------------------------------------
 
+class RemoteWriteRefused(Exception):
+    """AMP answered with a status other than 2xx, and the body says why."""
+
+    def __init__(self, status, detail):
+        super().__init__('remote_write refused with ' + str(status) + ': ' + detail)
+        self.status = status
+        self.detail = detail
+
+
 def remote_write(series):
-    """Sends one batch. Returns the HTTP status, or raises on a transport error."""
+    """Sends one batch. Returns the HTTP status, or raises with what AMP said.
+
+    A 400 here is not a transport failure, and reading it as one throws away the
+    only thing that explains the run. Prometheus answers 400 for a sample it
+    REFUSES -- a repeated instant carrying a different value, or one older than
+    the out-of-order window -- and the reason is in the response body. `urlopen`
+    raises before anyone reads that body, so a refusal used to reach the log as a
+    traceback with nothing in it about the cause.
+    """
     if not WORKSPACE_ENDPOINT:
         raise RuntimeError('No workspace endpoint: wire the Lambda to the workspace.')
 
@@ -210,8 +228,52 @@ def remote_write(series):
     SigV4Auth(credentials, 'aps', REGION).add_auth(request)
 
     sent = urllib.request.Request(url, data=body, headers=dict(request.headers), method='POST')
-    with urllib.request.urlopen(sent, timeout=30) as response:
-        return response.status
+    try:
+        with urllib.request.urlopen(sent, timeout=30) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        raise RemoteWriteRefused(error.code,
+                                 error.read().decode('utf-8', 'replace')[:500]) from None
+
+
+def write_series(series, diagnostics):
+    """Writes a batch, and on a refusal falls back to one request per series.
+
+    AMP refuses the WHOLE request over one bad sample. Without this fallback a
+    single conflicting instant loses every other series in the batch, and the
+    object goes with them -- the two asynchronous retries send identical bytes
+    and are refused identically.
+
+    THE CONFLICT IS REAL AND IT IS NOT RARE. Measured on 2026-09-22, ten minutes
+    into the first run, with ONE network interface: two objects of the same
+    delivery both carried bucket 1790117040 for the same pair, one saying 2778
+    bytes and the other 1401, because AWS had split that capture window across
+    two files. Whichever arrives second is refused.
+
+    One request per series costs N requests on a bad batch and nothing on a good
+    one, and it names the series that conflicted instead of losing the evidence.
+    A 5xx is re-raised: there the bytes are fine and a retry is what helps.
+    """
+    if not series:
+        return
+    try:
+        status = remote_write(series)
+        print('remote_write status ' + str(status) + ', series ' + str(len(series)))
+        return
+    except RemoteWriteRefused as refusal:
+        if refusal.status >= 500:
+            raise
+        print('Batch of ' + str(len(series)) + ' refused: ' + str(refusal))
+        diagnostics['batches_refused'] += 1
+
+    for labels, samples in series:
+        try:
+            remote_write([(labels, samples)])
+            diagnostics['series_written_singly'] += 1
+        except RemoteWriteRefused as single:
+            diagnostics['series_refused'] += 1
+            print(json.dumps({'metric': 'struct8_series_refused',
+                              'labels': labels, 'detail': single.detail[:200]}))
 
 
 # --- reading the flow log ---------------------------------------------------------
@@ -573,19 +635,22 @@ def lambda_handler(event, context):
             print('Skipped ' + key + ': ' + str(error))
 
     totals = cut_to_top_n(accumulate(records, cidrs, diagnostics))
-    series = to_series(totals, diagnostics) + diagnostic_series(diagnostics)
+    edge_series = to_series(totals, diagnostics)
 
-    if not series:
+    if not edge_series:
         print('Nothing to write. Diagnostics: ' + json.dumps(dict(diagnostics)))
         return {'statusCode': 200, 'body': 'no closed buckets'}
 
-    status = remote_write(series)
-    print('remote_write status ' + str(status) + ', series ' + str(len(series)))
+    write_series(edge_series, diagnostics)
+    # The diagnostics go in a request of their own, AFTER the edges, so a refused
+    # edge batch does not take with it the numbers that explain the refusal.
+    write_series(diagnostic_series(diagnostics), diagnostics)
+
     print('Diagnostics: ' + json.dumps(dict(diagnostics)))
 
     return {
         'statusCode': 200,
-        'body': json.dumps({'series': len(series), 'diagnostics': dict(diagnostics)}),
+        'body': json.dumps({'series': len(edge_series), 'diagnostics': dict(diagnostics)}),
     }
 
 

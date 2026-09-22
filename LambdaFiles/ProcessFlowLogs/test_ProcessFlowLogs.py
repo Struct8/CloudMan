@@ -312,5 +312,60 @@ check('the diagnostic instant keeps the milliseconds', instant == 1758549780123,
       'invocations in the same second would then collide)')
 
 
+print('\n=== the batch AMP refuses ===')
+
+# Measured on 2026-09-22, ten minutes into the first real run with ONE network
+# interface: two objects of the same delivery both carried bucket 1790117040 for
+# the same pair, 2778 bytes against 1401, because AWS split that capture window
+# across two files. The second write is refused, and AMP refuses the WHOLE
+# request -- so without the fallback the other nine series go with it.
+
+batch_sizes = []
+
+
+def _refuses_the_batch(series):
+    """AMP's behaviour: one bad sample refuses everything sent with it."""
+    batch_sizes.append(len(series))
+    if len(series) > 1:
+        raise pfl.RemoteWriteRefused(400, 'duplicate sample for timestamp')
+    if dict(series[0][0]).get('__name__') == 'struct8_edge_bytes':
+        raise pfl.RemoteWriteRefused(400, 'duplicate sample for timestamp')
+    return 200
+
+
+def _server_is_down(series):
+    raise pfl.RemoteWriteRefused(503, 'service unavailable')
+
+
+original_remote_write = pfl.remote_write
+refused_diagnostics = defaultdict(int)
+pfl.remote_write = _refuses_the_batch
+with contextlib.redirect_stdout(io.StringIO()):
+    pfl.write_series([
+        ({'__name__': 'struct8_edge_bytes'}, [(1790117040000, 1401.0)]),
+        ({'__name__': 'struct8_edge_packets'}, [(1790117040000, 13.0)]),
+        ({'__name__': 'struct8_flowlog_records_seen_total'}, [(1790117040000, 16.0)]),
+    ], refused_diagnostics)
+pfl.remote_write = original_remote_write
+
+check('a refused batch is resent one series at a time',
+      batch_sizes == [3, 1, 1, 1], str(batch_sizes))
+check('only the conflicting series is lost; the other two get through',
+      refused_diagnostics['series_refused'] == 1
+      and refused_diagnostics['series_written_singly'] == 2,
+      str(dict(refused_diagnostics)))
+
+pfl.remote_write = _server_is_down
+reraised = False
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        pfl.write_series([({'__name__': 'x'}, [(1, 1.0)])], defaultdict(int))
+except pfl.RemoteWriteRefused:
+    reraised = True
+pfl.remote_write = original_remote_write
+check('a 5xx is re-raised instead: there the bytes are fine and a retry helps',
+      reraised)
+
+
 print('\n' + ('all checks passed' if not failures else 'FAILED: ' + ', '.join(failures)))
 sys.exit(1 if failures else 0)

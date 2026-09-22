@@ -5,13 +5,21 @@
 # log delivers records whose log-status is NODATA, ProcessFlowLogs writes no
 # series, and an empty graph looks exactly like a broken pipeline.
 #
-# TWO DESTINATIONS, ON PURPOSE. They exercise the two branches of the endpoint
-# collapse that ProcessFlowLogs performs:
+# THREE DESTINATIONS, ON PURPOSE. They exercise three different branches of the
+# endpoint collapse that ProcessFlowLogs performs:
 #
-#   checkip.amazonaws.com  -- a public address with no service name on the
-#                             record, so the far end collapses to `internet`
 #   s3.<region>.amazonaws.com -- inside an AWS range, so the record fills
 #                             pkt-dst-aws-service and the far end is named `S3`
+#   checkip.amazonaws.com  -- also AWS-owned, and it lands on the generic
+#                             `AMAZON` range rather than a named service
+#   www.google.com         -- outside every AWS range, so no service name is on
+#                             the record and the far end collapses to `internet`
+#
+# THE THIRD ONE IS NOT DECORATION. The first run of this lab, on 2026-09-22, had
+# only the two Amazon destinations, and the workspace came back with dst_id in
+# {AMAZON, EC2, S3} and no `internet` at all: the branch that matters most for
+# cardinality had no traffic to prove it. An address being public is not what
+# makes it the internet here -- the record naming no service is.
 #
 # A run every 20 seconds keeps every 60-second aggregation window populated, so
 # no bucket is skipped for lack of traffic.
@@ -30,7 +38,7 @@ Wants=network-online.target
 [Service]
 Restart=always
 RestartSec=5
-ExecStart=/bin/bash -c 'while true; do curl -s -o /dev/null --max-time 5 https://checkip.amazonaws.com/; curl -s -o /dev/null --max-time 5 https://s3.$REGION.amazonaws.com/; sleep 20; done'
+ExecStart=/bin/bash -c 'while true; do curl -s -o /dev/null --max-time 5 https://checkip.amazonaws.com/; curl -s -o /dev/null --max-time 5 https://s3.$REGION.amazonaws.com/; curl -s -o /dev/null --max-time 5 https://www.google.com/; sleep 20; done'
 
 [Install]
 WantedBy=multi-user.target
