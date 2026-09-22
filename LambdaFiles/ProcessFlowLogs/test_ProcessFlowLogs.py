@@ -14,6 +14,7 @@ Exit code is 1 on any failure, so this can gate a pipeline.
 """
 
 import importlib.util
+import io
 import ipaddress
 import os
 import struct
@@ -241,6 +242,75 @@ pfl.CUTOFF_SECONDS = original_cutoff
 check('one bytes series and one packets series per edge',
       len(series) == len(totals) * 2, str(len(series)))
 check('every series carries __name__', all('__name__' in l for l, _ in series))
+
+# --- the S3 notification, which is how this Lambda is actually invoked ------------
+
+print('\n=== the S3 notification event ===')
+
+NOTIFICATION = {'Records': [
+    {'s3': {'object': {'key': 'AWSLogs/123456789012/vpcflowlogs/us-east-1/2026/09/22/'
+                              '123456789012_vpcflowlogs_us-east-1_fl-0abc_a1b2.log.gz'}}},
+    # Our own output. The notification filter should never send it, and step 1
+    # refuses it anyway -- the guard that survives someone editing the filter.
+    {'s3': {'object': {'key': 'struct8/partials/whatever.json'}}},
+    # S3 percent-encodes the key. Asking for it undecoded asks for an object that
+    # does not exist, and the file is lost with a 404 nobody reads.
+    {'s3': {'object': {'key': 'AWSLogs/a%3Db/file+name.log.gz'}}},
+]}
+
+keys = pfl.keys_from_event(NOTIFICATION, 'any-bucket')
+# Reaching this line at all proves no listing was attempted: the stub raises.
+check('two keys survive, our own output is not one of them',
+      len(keys) == 2 and not any(k.startswith(pfl.OUTPUT_PREFIX) for k in keys), str(keys))
+check('the delivered object comes from the event', keys[0].endswith('_a1b2.log.gz'))
+check('the key is percent-decoded', 'AWSLogs/a=b/file name.log.gz' in keys, str(keys))
+
+
+print('\n=== the delivery delay, which is what the lab exists to measure ===')
+
+import contextlib
+import json
+
+delay_records = [
+    {'end': '1758549840'},
+    {'end': '1758549900'},  # the newest window, and the one the delay is measured from
+    {'end': '-'},           # absent: the flow log writes '-' for a field it has no value for
+]
+captured = io.StringIO()
+with contextlib.redirect_stdout(captured):
+    pfl.report_delivery_delay('AWSLogs/x.log.gz', delay_records, 1758550500)
+line = json.loads(captured.getvalue().strip())
+check('the delay counts from the NEWEST window in the file',
+      line['delay_seconds'] == 600, str(line))
+check('the line is JSON, so Logs Insights finds the field by name',
+      line['metric'] == 'struct8_delivery_delay' and line['records'] == 3, str(line))
+
+captured = io.StringIO()
+with contextlib.redirect_stdout(captured):
+    pfl.report_delivery_delay('AWSLogs/empty.log.gz', [{'end': '-'}], 1758550500)
+check('a file with no usable window logs nothing', captured.getvalue() == '',
+      repr(captured.getvalue()))
+
+
+print('\n=== the diagnostic instant, in milliseconds ===')
+
+
+class _ClockBetweenSeconds:
+    """Stopped between two whole seconds, which is what second precision loses."""
+
+    def time(self):
+        return 1758549780.123
+
+
+original_time = pfl.time
+pfl.time = _ClockBetweenSeconds()
+diagnostic = pfl.diagnostic_series({'files_processed': 1})
+pfl.time = original_time
+instant = diagnostic[0][1][0][0]
+check('the diagnostic instant keeps the milliseconds', instant == 1758549780123,
+      str(instant) + ' (second precision would give 1758549780000, and two '
+      'invocations in the same second would then collide)')
+
 
 print('\n' + ('all checks passed' if not failures else 'FAILED: ' + ', '.join(failures)))
 sys.exit(1 if failures else 0)

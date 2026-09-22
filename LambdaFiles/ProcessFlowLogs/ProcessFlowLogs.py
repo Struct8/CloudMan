@@ -458,8 +458,21 @@ def to_series(totals, diagnostics):
 
 
 def diagnostic_series(diagnostics):
-    """The diagnosis travels with the number, and as series it gains history."""
-    timestamp_ms = int(time.time()) * 1000
+    """The diagnosis travels with the number, and as series it gains history.
+
+    THE INSTANT IS IN MILLISECONDS, and under the S3 notification that is not a
+    detail. One delivery drops several objects at once, so several invocations
+    run at the same moment, each holding counts of its own. At second precision
+    two of them land on the same instant with different values; Prometheus
+    refuses that for the WHOLE request, so a single collision loses every edge
+    series in the batch, not just the counter -- and the object is gone after the
+    two asynchronous retries fail the same way.
+
+    Milliseconds make the collision rare. They do not make it impossible: a
+    counter written by every invocation has no instant that is correct for all of
+    them. What removes it is the single writer of the study's §12.
+    """
+    timestamp_ms = int(time.time() * 1000)
     out = []
     for name, value in diagnostics.items():
         out.append((
@@ -467,6 +480,43 @@ def diagnostic_series(diagnostics):
             [(timestamp_ms, value)],
         ))
     return out
+
+
+def report_delivery_delay(key, records, now):
+    """Logs how long after its window closed the newest record in a file arrived.
+
+    This is the measurement the study calls blocking. The cut has to sit past the
+    tail of this distribution, and a cut set short drops data with nothing but a
+    counter to say so -- so until the tail is measured, the cut is a guess.
+
+    It goes to the LOG and not to a series, on purpose. A percentile wants every
+    observation, and a gauge written once per invocation would both lose most of
+    them and collide with the next invocation's instant, the same way the
+    diagnostics above do. The line is JSON so Logs Insights discovers the fields:
+
+      filter metric = "struct8_delivery_delay"
+      | stats count(*), avg(delay_seconds), max(delay_seconds),
+              pct(delay_seconds, 50), pct(delay_seconds, 95), pct(delay_seconds, 99)
+    """
+    ends = []
+    for record in records:
+        raw = value_of(record, 'end')
+        if raw is None:
+            continue
+        try:
+            ends.append(int(raw))
+        except ValueError:
+            continue
+    if not ends:
+        return
+    newest = max(ends)
+    print(json.dumps({
+        'metric': 'struct8_delivery_delay',
+        'key': key,
+        'records': len(records),
+        'window_end': newest,
+        'delay_seconds': now - newest,
+    }))
 
 
 # --- handler ----------------------------------------------------------------------
@@ -511,10 +561,13 @@ def lambda_handler(event, context):
     print('Known CIDRs: ' + str([str(network) for network, _ in cidrs]))
 
     records = []
+    now = int(time.time())
     for key in keys:
         try:
-            records.extend(read_text_object(bucket, key))
+            from_this_file = list(read_text_object(bucket, key))
+            records.extend(from_this_file)
             diagnostics['files_processed'] += 1
+            report_delivery_delay(key, from_this_file, now)
         except Exception as error:  # noqa: BLE001 -- one bad file must not stop the run
             diagnostics['files_skipped'] += 1
             print('Skipped ' + key + ': ' + str(error))
