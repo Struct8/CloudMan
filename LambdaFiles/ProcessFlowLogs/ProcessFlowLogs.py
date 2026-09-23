@@ -24,6 +24,7 @@ import io
 import ipaddress
 import json
 import os
+import random
 import struct
 import time
 import urllib.error
@@ -66,6 +67,27 @@ FLOW_BUCKET_NAME = (
 )
 
 REGION = os.environ.get('AWS_REGION', 'us-east-1')
+
+# The account every series belongs to. A workspace accepts remote_write from any
+# account, and centralising on one is a reason the workspace was chosen at all --
+# so without this label two accounts that happen to name a box the same way write
+# to the SAME series and their traffic silently adds up. The generator already
+# puts the value in the environment; nothing read it until now.
+ACCOUNT = os.environ.get('ACCOUNT', '')
+
+# How long a described fact is trusted before being read again.
+#
+# WHY A TIMER AND NOT JUST THE CONTAINER'S LIFETIME. A warm Lambda keeps its
+# module globals between invocations, which is what makes the cache worth having
+# -- but a function invoked every few minutes never goes cold, so a map read once
+# would be trusted forever. A box renamed in the diagram would keep reporting the
+# old name for as long as the container lived, which can be hours.
+#
+# TEN MINUTES IS THE SAME ORDER AS THE DATA IT LABELS. The flow log arrives 63 to
+# 68 s late in a window's first object and 333 to 338 s in its second (measured
+# 2026-09-22), so what is being written is already minutes old. A cache fresher
+# than the data it names buys nothing, and costs a describe per invocation.
+DESCRIBE_TTL_SECONDS = int(os.environ.get('DESCRIBE_TTL_SECONDS', '600'))
 
 # Where the AWS delivery lands. The notification listens to this prefix only, and
 # step 1 refuses anything else -- the trap that survives someone editing the
@@ -322,8 +344,113 @@ def value_of(record, name):
 
 # --- naming the two ends ----------------------------------------------------------
 
+# Facts described from the account, kept between invocations of a warm container.
+# Module level on purpose: this is the only state that survives, and the whole
+# point is not to ask EC2 the same question once per delivered object.
+_cidrs_cache = {'expires_at': 0.0, 'blocks': []}
+_name_by_address = {}
+
+
+def _expiry():
+    """When a freshly read fact stops being trusted.
+
+    THE SPREAD IS NOT DECORATION. Containers that started together expire
+    together, and twenty of them re-reading in the same instant is a burst
+    against the CUSTOMER's EC2 request quota -- shared with everything else they
+    run, so the symptom lands somewhere else entirely.
+
+    Random here, unlike `write_offset_ms`, which derives its value from the keys
+    so a retry lands on the same instant. There the point is to reproduce; here
+    it is to scatter.
+    """
+    return time.time() + DESCRIBE_TTL_SECONDS * random.uniform(0.85, 1.15)
+
+
+# Conservative chunk for a filter's value list -- not a measured ceiling. EC2
+# refuses an over-long filter outright, and a refusal here would cost the names
+# of a whole batch.
+ADDRESS_CHUNK = 100
+
+
+def names_for_addresses(addresses):
+    """`address -> Name tag`, asking EC2 only for what is missing or stale.
+
+    FILTERED BY ADDRESS, NOT BY INSTANCE ID, and that is what makes one call
+    serve both ends of a flow. A record names the instance of the interface that
+    CAPTURED it -- the sender, on an egress record -- so the destination inside
+    the VPC arrives as an address and nothing else. Looking both up by address
+    names the two ends with the same answer.
+
+    AND FILTERED, NOT LISTED BY ID: `describe_instances(InstanceIds=[...])` fails
+    the whole call when one id no longer exists, and an instance that has just
+    been replaced is exactly what this is asked about. A filter returns what it
+    finds and says nothing about the rest.
+
+    An address EC2 does not know -- the interface of a load balancer, of a
+    database, of a Lambda in a VPC -- is cached as having no name, so the miss is
+    not paid again on every object.
+    """
+    now = time.time()
+    unknown = sorted(
+        address for address in addresses
+        if address and _name_by_address.get(address, {}).get('expires_at', 0.0) <= now
+    )
+
+    for start in range(0, len(unknown), ADDRESS_CHUNK):
+        chunk = unknown[start:start + ADDRESS_CHUNK]
+        found = {}
+        try:
+            paginator = ec2.get_paginator('describe_instances')
+            for page in paginator.paginate(
+                    Filters=[{'Name': 'private-ip-address', 'Values': chunk}]):
+                for reservation in page.get('Reservations', []):
+                    for instance in reservation.get('Instances', []):
+                        name = ''
+                        for tag in instance.get('Tags', []):
+                            if tag.get('Key') == 'Name':
+                                name = tag.get('Value', '')
+                        for interface in instance.get('NetworkInterfaces', []):
+                            for entry in interface.get('PrivateIpAddresses', []):
+                                address = entry.get('PrivateIpAddress')
+                                if address:
+                                    found[address] = name
+        except Exception as error:  # noqa: BLE001 -- a name is worth less than the run
+            # Nothing is cached: a transport failure is not evidence that these
+            # addresses have no name, and caching it as one would hide the
+            # resource until the entry expired.
+            print('describe_instances failed for ' + str(len(chunk))
+                  + ' addresses: ' + str(error))
+            continue
+        for address in chunk:
+            _name_by_address[address] = {'name': found.get(address, ''),
+                                         'expires_at': _expiry()}
+
+    return {address: entry['name']
+            for address, entry in _name_by_address.items() if entry['name']}
+
+
+def addresses_in(records, cidrs):
+    """Every in-VPC address the batch mentions -- what is worth describing.
+
+    Outside the known CIDRs an end collapses to a single point anyway (§ the
+    `internet`/`S3` branch below), so describing those would buy nothing and
+    would send the customer's own address space to EC2 one page at a time.
+    """
+    out = set()
+    for record in records:
+        for side in ('src', 'dst'):
+            address = (value_of(record, 'pkt-' + side + 'addr')
+                       or value_of(record, side + 'addr') or '')
+            if address and scope_of_address(address, cidrs):
+                out.add(address)
+    return out
+
+
 def known_cidrs():
     """The CIDRs of the VPCs this account can describe, with the customer's role."""
+    if _cidrs_cache['blocks'] and _cidrs_cache['expires_at'] > time.time():
+        return _cidrs_cache['blocks']
+
     blocks = []
     paginator = ec2.get_paginator('describe_vpcs')
     for page in paginator.paginate():
@@ -341,6 +468,9 @@ def known_cidrs():
                 block = association.get('Ipv6CidrBlock')
                 if block:
                     blocks.append((ipaddress.ip_network(block), vpc['VpcId']))
+
+    _cidrs_cache['blocks'] = blocks
+    _cidrs_cache['expires_at'] = _expiry()
     return blocks
 
 
@@ -366,14 +496,25 @@ def is_private(address):
     return parsed.is_private or parsed in ipaddress.ip_network('100.64.0.0/10')
 
 
-def name_endpoint(record, side, cidrs):
-    """Returns the four labels for one end: id, address, scope and type.
+def name_endpoint(record, side, cidrs, names=None):
+    """Returns the five labels for one end: id, address, scope, type and name.
 
     Identity before address, because an address is reassigned and an id is not. Both
     are emitted when both exist: a disagreement between them is the only free signal
     that the address map has gone stale.
+
+    THE NAME IS WHAT GROUPS SIBLINGS, and it is the box's own name: the generator
+    writes `tags["Name"] = <logical name>` on everything it creates, and an Auto
+    Scaling group writes it with `propagate_at_launch`, so every instance the
+    group raises is born carrying it. That is why `src_id` stays per-instance and
+    the collapse happens on `src_name`: summing by name gives the group, summing
+    by id gives the machine, and neither is thrown away.
+
+    Read from the RECORD first. With `tag_field_specification` the flow log
+    carries the tag itself, and then nothing has to be described at all -- the
+    describe below is the fallback, not the design.
     """
-    address = value_of(record, 'pkt_' + side + 'addr') or value_of(record, side + 'addr') or ''
+    address = value_of(record, 'pkt-' + side + 'addr') or value_of(record, side + 'addr') or ''
     scope = scope_of_address(address, cidrs)
 
     if scope:
@@ -389,11 +530,15 @@ def name_endpoint(record, side, cidrs):
         interface_type = value_of(record, 'interface-type')
         if interface_type and side == 'src':
             kind = interface_type
+        # `instance-tag` only exists for the interface that captured the record,
+        # which is the source side; the destination is named by the address map.
+        from_record = value_of(record, 'instance-tag') if side == 'src' else None
         return {
             side + '_id': identifier,
             side + '_addr': address,
             side + '_scope': scope,
             side + '_type': kind,
+            side + '_name': from_record or (names or {}).get(address, ''),
         }
 
     # Outside every known CIDR the canvas has no box to draw, so the end collapses.
@@ -418,12 +563,16 @@ def name_endpoint(record, side, cidrs):
         side + '_addr': '',
         side + '_scope': 'external',
         side + '_type': kind,
+        # A collapsed end IS its name -- `S3`, `internet`, `on-premises`. Saying
+        # so keeps `sum by (src_name, dst_name)` a complete question instead of
+        # one that silently drops every external edge.
+        side + '_name': collapsed,
     }
 
 
 # --- aggregation ------------------------------------------------------------------
 
-def accumulate(records, cidrs, diagnostics):
+def accumulate(records, cidrs, diagnostics, names=None):
     """(bucket, labels) -> [bytes, packets], keeping only the egress direction."""
     totals = defaultdict(lambda: [0, 0])
 
@@ -460,8 +609,8 @@ def accumulate(records, cidrs, diagnostics):
         bucket = (start // BUCKET_SECONDS) * BUCKET_SECONDS
 
         labels = {}
-        labels.update(name_endpoint(record, 'src', cidrs))
-        labels.update(name_endpoint(record, 'dst', cidrs))
+        labels.update(name_endpoint(record, 'src', cidrs, names))
+        labels.update(name_endpoint(record, 'dst', cidrs, names))
 
         port = value_of(record, 'dstport')
         if port:
@@ -474,25 +623,55 @@ def accumulate(records, cidrs, diagnostics):
     return totals
 
 
+def group_of(labels):
+    """The identity the cut competes on: the name when there is one, else the id."""
+    as_dict = dict(labels)
+    return (
+        as_dict.get('src_name') or as_dict.get('src_id') or as_dict.get('src_addr', ''),
+        as_dict.get('dst_name') or as_dict.get('dst_id') or as_dict.get('dst_addr', ''),
+    )
+
+
 def cut_to_top_n(totals):
-    """Top N pairs per bucket, plus one `rest` row so the total still closes."""
+    """Top N per bucket, plus one `rest` row so the total still closes.
+
+    IT RANKS GROUPS AND KEEPS MEMBERS, and the difference is the whole reason
+    this is not a plain sort. Fifty instances of one Auto Scaling group are ONE
+    thing that talks, spread over fifty series because each machine has its own
+    id. Ranked separately they divide their own traffic fifty ways and a group
+    that is the busiest thing in the VPC gets pushed out of the cut by resources
+    that move a fraction of what it does -- and the `rest` row hides it, because
+    a total that still closes looks right.
+
+    Ranking by group and then keeping every member of a surviving group gives
+    both readings: sum by name for the group, by id for the machine.
+    """
     by_bucket = defaultdict(list)
     for (bucket, labels), values in totals.items():
         by_bucket[bucket].append((labels, values))
 
     kept = {}
     for bucket, rows in by_bucket.items():
-        rows.sort(key=lambda row: row[1][0], reverse=True)
-        for labels, values in rows[:TOP_N_PAIRS]:
-            kept[(bucket, labels)] = values
-        overflow = rows[TOP_N_PAIRS:]
+        group_bytes = defaultdict(int)
+        for labels, values in rows:
+            group_bytes[group_of(labels)] += values[0]
+        ranked = sorted(group_bytes, key=lambda group: group_bytes[group], reverse=True)
+        surviving = set(ranked[:TOP_N_PAIRS])
+
+        overflow = []
+        for labels, values in rows:
+            if group_of(labels) in surviving:
+                kept[(bucket, labels)] = values
+            else:
+                overflow.append(values)
+
         if overflow:
-            rest = [sum(v[1][0] for v in overflow), sum(v[1][1] for v in overflow)]
+            rest = [sum(v[0] for v in overflow), sum(v[1] for v in overflow)]
             rest_labels = (
                 ('src_id', 'rest'), ('src_addr', ''), ('src_scope', 'aggregate'),
-                ('src_type', 'rest'),
+                ('src_type', 'rest'), ('src_name', 'rest'),
                 ('dst_id', 'rest'), ('dst_addr', ''), ('dst_scope', 'aggregate'),
-                ('dst_type', 'rest'),
+                ('dst_type', 'rest'), ('dst_name', 'rest'),
             )
             kept[(bucket, rest_labels)] = rest
     return kept
@@ -549,6 +728,10 @@ def to_series(totals, diagnostics, offset_ms=0):
     series = []
     for (labels, metric), samples in grouped.items():
         full = {'__name__': metric}
+        # Before the rest, so a label named `account` coming from anywhere else
+        # could not quietly take its place.
+        if ACCOUNT:
+            full['account'] = ACCOUNT
         full.update(dict(labels))
         series.append((full, sorted(samples)))
     return series
@@ -677,7 +860,13 @@ def lambda_handler(event, context):
     offset_ms = write_offset_ms(read_keys)
     print('write offset: ' + str(offset_ms) + ' ms into each bucket')
 
-    totals = cut_to_top_n(accumulate(records, cidrs, diagnostics))
+    # One describe at most, for the addresses this batch mentions and the cache
+    # does not already hold. In the steady state of a warm container that list is
+    # empty and EC2 is not called at all.
+    names = names_for_addresses(addresses_in(records, cidrs))
+    diagnostics['addresses_named'] = len(names)
+
+    totals = cut_to_top_n(accumulate(records, cidrs, diagnostics, names))
     edge_series = to_series(totals, diagnostics, offset_ms)
 
     if not edge_series:

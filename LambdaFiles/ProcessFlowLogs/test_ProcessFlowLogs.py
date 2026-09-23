@@ -417,5 +417,214 @@ check('with no offset the two would land on the same instant -- the 400',
       == pfl.to_series({(BUCKET, PAIR): [1401, 13]}, defaultdict(int))[0][1][0][0])
 
 
+print('\n=== the ORIGINAL address, which was never being read ===')
+
+LAB_CIDRS = [(ipaddress.ip_network('10.3.0.0/16'), 'vpc-lab')]
+
+# `pkt-srcaddr` carries the address BEFORE an intermediary rewrote it. The code
+# asked for `pkt_srcaddr` -- an underscore, where every flow log field is spelled
+# with a hyphen -- so the lookup never matched and the fallback always won. Behind
+# a NAT gateway that attributes every flow to the NAT instead of the machine that
+# sent it, with a number that looks perfectly sane.
+behind_nat = {'srcaddr': '10.3.0.200', 'pkt-srcaddr': '10.3.0.31',
+              'dstaddr': '52.1.2.3', 'traffic-path': '2'}
+src = pfl.name_endpoint(behind_nat, 'src', LAB_CIDRS)
+check('the original address wins over the rewritten one',
+      src['src_addr'] == '10.3.0.31', src['src_addr'])
+check('and the field is spelled the way the header spells it',
+      pfl.value_of({'pkt-srcaddr': '10.3.0.31'}, 'pkt-srcaddr') == '10.3.0.31')
+check('while the old spelling finds nothing, which is why it was silent',
+      pfl.value_of({'pkt-srcaddr': '10.3.0.31'}, 'pkt_srcaddr') is None)
+
+
+print('\n=== the name, which is what groups siblings ===')
+
+named = pfl.name_endpoint(
+    {'srcaddr': '10.3.0.31', 'instance-id': 'i-aaa', 'instance-tag': 'web-fleet'},
+    'src', LAB_CIDRS)
+check('the record names itself when the tag travels in it',
+      named['src_name'] == 'web-fleet', named['src_name'])
+check('and the id stays per-machine, so both readings survive',
+      named['src_id'] == 'i-aaa', named['src_id'])
+
+described = pfl.name_endpoint(
+    {'srcaddr': '10.3.0.31', 'instance-id': 'i-aaa'}, 'src', LAB_CIDRS,
+    {'10.3.0.31': 'web-fleet'})
+check('without the tag in the record, the described map names it',
+      described['src_name'] == 'web-fleet', described['src_name'])
+
+both = pfl.name_endpoint(
+    {'srcaddr': '10.3.0.31', 'instance-id': 'i-aaa', 'instance-tag': 'from-record'},
+    'src', LAB_CIDRS, {'10.3.0.31': 'from-describe'})
+check('the record wins over the describe, because it is what AWS stamped',
+      both['src_name'] == 'from-record', both['src_name'])
+
+destination = pfl.name_endpoint(
+    {'srcaddr': '10.3.0.31', 'dstaddr': '10.3.0.77'}, 'dst', LAB_CIDRS,
+    {'10.3.0.77': 'the-database'})
+check('the far end is named too, and it never carries an instance id',
+      (destination['dst_name'], destination['dst_id']) == ('the-database', ''),
+      str((destination['dst_name'], destination['dst_id'])))
+
+external = pfl.name_endpoint(
+    {'srcaddr': '10.3.0.31', 'dstaddr': '52.1.2.3', 'traffic-path': '2'},
+    'dst', LAB_CIDRS)
+check('a collapsed end IS its name, so summing by name keeps external edges',
+      external['dst_name'] == 'internet', external['dst_name'])
+
+
+print('\n=== the account, without which two of them share a series ===')
+
+ACCOUNT_WAS = pfl.ACCOUNT
+pfl.ACCOUNT = '952133486861'
+labels_out = pfl.to_series({(BUCKET, PAIR): [10, 1]}, defaultdict(int))[0][0]
+check('every series says which account it came from',
+      labels_out.get('account') == '952133486861', str(labels_out.get('account')))
+pfl.ACCOUNT = ''
+check('and an account that was never configured adds no empty label',
+      'account' not in pfl.to_series({(BUCKET, PAIR): [10, 1]}, defaultdict(int))[0][0])
+pfl.ACCOUNT = ACCOUNT_WAS
+
+
+print('\n=== the cut ranks GROUPS and keeps MEMBERS ===')
+
+
+def row(src_name, dst_name, member, byte_count):
+    return (BUCKET, (('src_id', member), ('src_name', src_name),
+                     ('dst_id', dst_name), ('dst_name', dst_name))), [byte_count, 1]
+
+
+# One group of three machines moving 300 between them, against two single
+# resources moving more than any ONE of the three. Ranked row by row the group
+# loses every seat; ranked by group it wins the first.
+fleet = dict([
+    row('web-fleet', 'S3', 'i-a', 100),
+    row('web-fleet', 'S3', 'i-b', 100),
+    row('web-fleet', 'S3', 'i-c', 100),
+    row('the-database', 'S3', 'i-db', 250),
+    row('a-cache', 'S3', 'i-cache', 200),
+    row('noise', 'S3', 'i-noise', 10),
+])
+
+TOP_WAS = pfl.TOP_N_PAIRS
+pfl.TOP_N_PAIRS = 2
+cut = pfl.cut_to_top_n(fleet)
+pfl.TOP_N_PAIRS = TOP_WAS
+
+survivors = defaultdict(int)
+for (_, labels), values in cut.items():
+    survivors[dict(labels)['src_name']] += values[0]
+
+check('the group survives the cut whole: all three members kept',
+      survivors.get('web-fleet') == 300, str(survivors.get('web-fleet')))
+check('the second seat goes to the next group by TOTAL, not by biggest row',
+      survivors.get('the-database') == 250, str(survivors.get('the-database')))
+check('what lost is summed into `rest`, so the bucket still closes',
+      survivors.get('rest') == 210, str(survivors.get('rest')))
+check('and nothing was invented: 300 + 250 + 210 is what went in',
+      sum(survivors.values()) == 760, str(sum(survivors.values())))
+
+
+print('\n=== the caches, which is what keeps EC2 out of every invocation ===')
+
+
+class _FakePaginator:
+    def __init__(self, pages, calls, operation):
+        self.pages, self.calls, self.operation = pages, calls, operation
+
+    def paginate(self, **kwargs):
+        self.calls.append((self.operation, kwargs))
+        return self.pages
+
+
+class _FakeEc2:
+    def __init__(self, pages, calls, explode=False):
+        self.pages, self.calls, self.explode = pages, calls, explode
+
+    def get_paginator(self, operation):
+        if self.explode:
+            raise RuntimeError('EC2 said no')
+        return _FakePaginator(self.pages, self.calls, operation)
+
+
+VPC_PAGE = [{'Vpcs': [{'VpcId': 'vpc-lab',
+                       'CidrBlockAssociationSet': [{'CidrBlock': '10.3.0.0/16'}]}]}]
+EC2_WAS = pfl.ec2
+
+calls = []
+pfl.ec2 = _FakeEc2(VPC_PAGE, calls)
+pfl._cidrs_cache['expires_at'] = 0.0
+pfl._cidrs_cache['blocks'] = []
+first = pfl.known_cidrs()
+second = pfl.known_cidrs()
+check('the CIDRs are described once, not once per delivered object',
+      len(calls) == 1, str(len(calls)))
+check('and the second call answers from the cache, with the same content',
+      first == second)
+
+pfl._cidrs_cache['expires_at'] = time.time() - 1
+pfl.known_cidrs()
+check('once the timer runs out it reads again, so a rename is picked up',
+      len(calls) == 2, str(len(calls)))
+
+INSTANCE_PAGE = [{'Reservations': [{'Instances': [{
+    'Tags': [{'Key': 'Name', 'Value': 'web-fleet'}],
+    'NetworkInterfaces': [{'PrivateIpAddresses': [
+        {'PrivateIpAddress': '10.3.0.31'}, {'PrivateIpAddress': '10.3.0.32'}]}],
+}]}]}]
+
+calls = []
+pfl.ec2 = _FakeEc2(INSTANCE_PAGE, calls)
+pfl._name_by_address.clear()
+names = pfl.names_for_addresses({'10.3.0.31', '10.3.0.32'})
+check('one call names every address of the batch',
+      len(calls) == 1 and names.get('10.3.0.31') == 'web-fleet', str(names))
+check('and it asks by ADDRESS, not by instance id -- a dead id would fail the call',
+      calls[0][1]['Filters'][0]['Name'] == 'private-ip-address',
+      str(calls[0][1]['Filters'][0]['Name']))
+
+pfl.names_for_addresses({'10.3.0.31', '10.3.0.32'})
+check('asking again inside the timer costs nothing', len(calls) == 1, str(len(calls)))
+
+pfl.names_for_addresses({'10.3.0.31', '10.3.0.99'})
+check('only the address the cache lacks is asked for',
+      calls[1][1]['Filters'][0]['Values'] == ['10.3.0.99'],
+      str(calls[1][1]['Filters'][0]['Values']))
+
+pfl.names_for_addresses({'10.3.0.99'})
+check('an address EC2 does not know is remembered as nameless, not re-asked',
+      len(calls) == 2, str(len(calls)))
+
+calls = []
+pfl._name_by_address.clear()
+pfl.ec2 = _FakeEc2(INSTANCE_PAGE, calls, explode=True)
+check('a failed describe returns no names instead of taking the run down',
+      pfl.names_for_addresses({'10.3.0.31'}) == {})
+pfl.ec2 = _FakeEc2(INSTANCE_PAGE, calls)
+check('and it is NOT cached as nameless: a transport failure is not an answer',
+      pfl.names_for_addresses({'10.3.0.31'}).get('10.3.0.31') == 'web-fleet')
+
+pfl.ec2 = EC2_WAS
+
+spread = {pfl._expiry() for _ in range(50)}
+check('the timer is jittered, so containers that started together do not all '
+      'read at the same instant', len(spread) > 45, str(len(spread)))
+floor = time.time() + pfl.DESCRIBE_TTL_SECONDS * 0.85
+ceiling = time.time() + pfl.DESCRIBE_TTL_SECONDS * 1.15
+check('and the jitter stays inside its band',
+      all(floor - 1 <= value <= ceiling + 1 for value in spread))
+
+
+print('\n=== only in-VPC addresses are worth describing ===')
+
+outside = [{'srcaddr': '10.3.0.31', 'dstaddr': '52.1.2.3'},
+           {'srcaddr': '10.3.0.31', 'pkt-dstaddr': '10.3.0.77', 'dstaddr': '10.3.0.200'}]
+worth = pfl.addresses_in(outside, LAB_CIDRS)
+check('the public address is left out: it collapses to one point anyway',
+      '52.1.2.3' not in worth, str(sorted(worth)))
+check('and the ORIGINAL destination is the one collected, not the rewritten one',
+      worth == {'10.3.0.31', '10.3.0.77'}, str(sorted(worth)))
+
+
 print('\n' + ('all checks passed' if not failures else 'FAILED: ' + ', '.join(failures)))
 sys.exit(1 if failures else 0)
