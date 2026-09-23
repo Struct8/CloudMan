@@ -570,6 +570,48 @@ def name_endpoint(record, side, cidrs, names=None):
     }
 
 
+# The door a flow used to LEAVE the VPC, named from `traffic-path`.
+#
+# The field is already read above, to tell `internet` from `on-premises`; this
+# publishes it. Naming the far end says WHO was talked to, and this says THROUGH
+# WHAT -- and only the second one lands on a box that is drawn. An internet
+# gateway has no address and no interface, so a conversation that used one is
+# invisible on the canvas unless the record is asked. A NAT gateway is the
+# opposite case: it owns an ENI, so the hop to it is an ordinary flow between two
+# addresses and needs none of this.
+#
+# ⚠️ ONLY EGRESS RECORDS CARRY IT -- on ingress the field is `-`. That costs
+# nothing here, because the aggregator already keeps the egress side only.
+EGRESS_PATHS = {
+    '1': 'in_vpc',
+    '3': 'virtual_private_gateway',
+    '4': 'peering',
+    '5': 'peering',
+    '6': 'local_gateway',
+    '7': 'vpc_endpoint',
+    '8': 'internet_gateway',
+}
+
+
+def egress_path(record):
+    """What a flow went out through, or '' when the record cannot say.
+
+    VALUE 2 IS THE AMBIGUOUS ONE, and it is decided rather than rounded off.
+    Outside Nitro the field does not separate an internet gateway from a gateway
+    VPC endpoint; Nitro splits those into 8 and 7. A gateway endpoint only ever
+    serves S3 and DynamoDB, and those flows carry the service field -- so a
+    record WITH a service is genuinely undecidable and says nothing, while one
+    without it left through the internet gateway.
+
+    Answering `internet_gateway` for both would draw an edge to a gateway the
+    traffic never touched, on a canvas whose whole claim is that it measured.
+    """
+    path = value_of(record, 'traffic-path')
+    if path == '2':
+        return '' if value_of(record, 'pkt-dst-aws-service') else 'internet_gateway'
+    return EGRESS_PATHS.get(path, '')
+
+
 # --- aggregation ------------------------------------------------------------------
 
 def accumulate(records, cidrs, diagnostics, names=None):
@@ -615,6 +657,13 @@ def accumulate(records, cidrs, diagnostics, names=None):
         port = value_of(record, 'dstport')
         if port:
             labels['dstport'] = port
+
+        # Absent rather than empty when the record cannot say: an empty label is
+        # a series of its own in Prometheus, so writing one would split a pair
+        # into two series that differ by nothing anybody asked about.
+        egress = egress_path(record)
+        if egress:
+            labels['egress'] = egress
 
         key = (bucket, tuple(sorted(labels.items())))
         totals[key][0] += byte_count

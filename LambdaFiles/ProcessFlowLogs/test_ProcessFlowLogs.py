@@ -626,5 +626,55 @@ check('and the ORIGINAL destination is the one collected, not the rewritten one'
       worth == {'10.3.0.31', '10.3.0.77'}, str(sorted(worth)))
 
 
+
+print()
+print('=== the door a flow left through ===')
+
+# Measured on the account 2026-09-23: every one of the 59 egress records in a
+# real object carried `traffic-path 8`, and all 96 ingress records carried `-`.
+def egress_record(path, service=None):
+    record = {'srcaddr': '10.3.0.206', 'dstaddr': '16.15.252.172',
+              'traffic-path': path, 'flow-direction': 'egress',
+              'dstport': '443', 'protocol': '6', 'packets': '11',
+              'bytes': '1297', 'start': '1790165981', 'instance-id': 'i-lab'}
+    if service:
+        record['pkt-dst-aws-service'] = service
+    return record
+
+check('8 is an internet gateway, the one door that lands on a box that is drawn',
+      pfl.egress_path(egress_record('8')) == 'internet_gateway')
+check('7 is a gateway VPC endpoint, which is NOT the same door',
+      pfl.egress_path(egress_record('7', service='S3')) == 'vpc_endpoint')
+check('1 is another resource in the same VPC -- a NAT gateway, whose hop is '
+      'already an ordinary flow between two addresses',
+      pfl.egress_path(egress_record('1')) == 'in_vpc')
+check('3 is a virtual private gateway',
+      pfl.egress_path(egress_record('3')) == 'virtual_private_gateway')
+
+# The ambiguity that must not be rounded off: outside Nitro, 2 covers both the
+# internet gateway and a gateway VPC endpoint.
+check('2 WITHOUT a service left through the internet gateway',
+      pfl.egress_path(egress_record('2')) == 'internet_gateway')
+check('2 WITH a service is undecidable, and says nothing rather than guessing',
+      pfl.egress_path(egress_record('2', service='S3')) == '')
+
+check('an ingress record says nothing, because the field is `-` there',
+      pfl.egress_path({'traffic-path': '-'}) == '')
+check('and a record without the field at all says nothing',
+      pfl.egress_path({}) == '')
+
+egress_totals = pfl.accumulate([egress_record('8')], LAB_CIDRS, defaultdict(int))
+egress_labels = dict(list(egress_totals.keys())[0][1])
+check('the label reaches the series',
+      egress_labels.get('egress') == 'internet_gateway', str(egress_labels))
+
+# An empty label is a series of its own in Prometheus, so a pair would split in
+# two by something nobody asked about.
+quiet_labels = dict(list(pfl.accumulate([egress_record('-')], LAB_CIDRS,
+                                        defaultdict(int)).keys())[0][1])
+check('and it is ABSENT, not empty, when the record cannot say',
+      'egress' not in quiet_labels, str(quiet_labels))
+
+
 print('\n' + ('all checks passed' if not failures else 'FAILED: ' + ', '.join(failures)))
 sys.exit(1 if failures else 0)
