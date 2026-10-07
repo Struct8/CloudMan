@@ -77,7 +77,21 @@ Parameters:
       repository. Needs the repository's OIDC subject template to include
       job_workflow_ref (Struct8 sets that up); with GitHub's default template the
       subject carries no workflow and this role would refuse every run. false keeps
-      the exact-ref match alone.
+      the exact-ref match alone. AllowLocalEngineWorkflow adds one workflow of this
+      repository, the one that runs the engine on CodeBuild.
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+
+  AllowLocalEngineWorkflow:
+    Description: >-
+      With RequireEngineWorkflow set to true, also accept a run of
+      .github/workflows/struct8-engine-local.yml on the main branch of this
+      repository. Struct8 writes that file when the GitOps workspace is set to run
+      the engine on CodeBuild in your account, and its only step runs the Struct8
+      engine. No effect while RequireEngineWorkflow is false. Important: anyone who
+      can push to main can change that file, and the role then accepts what the
+      changed file runs.
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
@@ -103,6 +117,12 @@ Conditions:
   ShouldCreateOIDC: !Equals [ !Ref CreateOIDCProvider, "true" ]
   ShouldRequireEngineWorkflow: !Equals [ !Ref RequireEngineWorkflow, "true" ]
   HasSubjectRepoSegment: !Not [ !Equals [ !Ref SubjectRepoSegment, "" ] ]
+  ShouldAllowLocalEngineWorkflow: !And
+    - !Condition ShouldRequireEngineWorkflow
+    - !Equals [ !Ref AllowLocalEngineWorkflow, "true" ]
+  ShouldAllowLocalEngineWorkflowById: !And
+    - !Condition ShouldAllowLocalEngineWorkflow
+    - !Condition HasSubjectRepoSegment
 
 Resources:
   # 1. OIDC Provider (Optional)
@@ -226,6 +246,33 @@ Resources:
                     - !Sub
                       - "repo:${RepoSeg}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/lambda-sync.yml@refs/heads/main"
                       - RepoSeg: !If [ HasSubjectRepoSegment, !Ref SubjectRepoSegment, !Sub "${GitHubOrg}/${GitHubRepo}" ]
+                    # AllowLocalEngineWorkflow: the engine on a CodeBuild project of the
+                    # customer's account. That job cannot be engine.yml: GitHub lets a
+                    # reusable workflow use the caller's runners only when both have the
+                    # same owner, and engine.yml fixes `runs-on: ubuntu-latest`. So it
+                    # is .github/workflows/struct8-engine-local.yml of this repository,
+                    # whose one step calls Struct8/cloudman-core's
+                    # .github/actions/engine-run. What this trusts is that file on main,
+                    # not the engine's code -- the parameter's description says so to
+                    # whoever turns it on. main is hardcoded like Struct8's push paths;
+                    # a role with another GitHubSubject never matches these two.
+                    #
+                    # The second spelling carries the repository identifiers of
+                    # SubjectRepoSegment in job_workflow_ref as well. Not measured yet
+                    # whether GitHub writes the claim that way for such a repository;
+                    # the first CodeBuild run shows it in CloudTrail. Both spellings
+                    # name the same file of the same repository, and AWS::NoValue drops
+                    # whichever does not apply.
+                    - !If
+                      - ShouldAllowLocalEngineWorkflow
+                      - !Sub
+                        - "repo:${RepoSeg}:${GitHubSubject}:job_workflow_ref:${GitHubOrg}/${GitHubRepo}/.github/workflows/struct8-engine-local.yml@refs/heads/main"
+                        - RepoSeg: !If [ HasSubjectRepoSegment, !Ref SubjectRepoSegment, !Sub "${GitHubOrg}/${GitHubRepo}" ]
+                      - !Ref AWS::NoValue
+                    - !If
+                      - ShouldAllowLocalEngineWorkflowById
+                      - !Sub "repo:${SubjectRepoSegment}:${GitHubSubject}:job_workflow_ref:${SubjectRepoSegment}/.github/workflows/struct8-engine-local.yml@refs/heads/main"
+                      - !Ref AWS::NoValue
               # Flag off: any workflow on the ref -- and in BOTH spellings of the
               # subject. Once the repository's subject template includes
               # job_workflow_ref (the app sets it when it prepares a backend),
@@ -300,13 +347,18 @@ Outputs:
   AllowedSubject:
     Description: "The GitHub Actions subject(s) that can use this role"
     Value: !If
-      - ShouldRequireEngineWorkflow
+      - ShouldAllowLocalEngineWorkflow
       - !Sub
-        - "repo:${RepoSeg}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/{engine.yml@refs/heads/<devlocal|dev|test|alpha|main> | lambda-sync.yml@refs/heads/main}"
+        - "repo:${RepoSeg}:${GitHubSubject}:job_workflow_ref:{Struct8/cloudman-core/.github/workflows/{engine.yml@refs/heads/<devlocal|dev|test|alpha|main> | lambda-sync.yml@refs/heads/main} | ${GitHubOrg}/${GitHubRepo}/.github/workflows/struct8-engine-local.yml@refs/heads/main}"
         - RepoSeg: !If [ HasSubjectRepoSegment, !Ref SubjectRepoSegment, !Sub "${GitHubOrg}/${GitHubRepo}" ]
-      - !Sub
-        - "repo:${RepoSeg}:${GitHubSubject}"
-        - RepoSeg: !If [ HasSubjectRepoSegment, !Ref SubjectRepoSegment, !Sub "${GitHubOrg}/${GitHubRepo}" ]
+      - !If
+        - ShouldRequireEngineWorkflow
+        - !Sub
+          - "repo:${RepoSeg}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/{engine.yml@refs/heads/<devlocal|dev|test|alpha|main> | lambda-sync.yml@refs/heads/main}"
+          - RepoSeg: !If [ HasSubjectRepoSegment, !Ref SubjectRepoSegment, !Sub "${GitHubOrg}/${GitHubRepo}" ]
+        - !Sub
+          - "repo:${RepoSeg}:${GitHubSubject}"
+          - RepoSeg: !If [ HasSubjectRepoSegment, !Ref SubjectRepoSegment, !Sub "${GitHubOrg}/${GitHubRepo}" ]
 
   BucketName:
     Condition: ShouldCreateS3
