@@ -1,0 +1,13 @@
+{
+  "name": "produtos-lambda-busca",
+  "version": "1.0.0",
+  "description": "Endpoint de busca de produtos via Aurora Data API (FTS + pg_trgm)",
+  "type": "module",
+  "main": "index.mjs",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@aws-sdk/client-rds-data": "^3.670.0"
+  }
+}
