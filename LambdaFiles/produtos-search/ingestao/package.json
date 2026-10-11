@@ -1,0 +1,13 @@
+{
+  "name": "produtos-lambda-ingestao",
+  "version": "1.0.0",
+  "description": "Worker de ingestao/indexacao de produtos via Aurora Data API (acionado por SQS)",
+  "type": "module",
+  "main": "index.mjs",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@aws-sdk/client-rds-data": "^3.670.0"
+  }
+}
