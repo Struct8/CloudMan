@@ -20,6 +20,27 @@ const DB_NAME = process.env.AWS_RDS_CLUSTER_DB_NAME_0 || "produtos";
 
 const client = new RDSDataClient({ region: REGION });
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Retry enquanto o Aurora Serverless v2 acorda do auto-pause.
+// Sem isso, a primeira mensagem depois de ocioso falha e fica em loop na fila.
+async function sendWithResumeRetry(command, { retries = 5, delayMs = 1500 } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await client.send(command);
+    } catch (err) {
+      const resuming =
+        err?.name === "DatabaseResumingException" ||
+        /resuming after being auto-paused/i.test(err?.message || "");
+      if (resuming && attempt < retries) {
+        await sleep(delayMs);
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 const UPSERT_SQL = `
   INSERT INTO produtos (id, nome, marca, categoria, descricao, preco, imagem_url, specs)
   VALUES (:id, :nome, :marca, :categoria, :descricao, :preco, :imagem_url, CAST(:specs AS jsonb))
@@ -55,7 +76,7 @@ async function upsertProduto(p) {
     { name: "specs", value: { stringValue: JSON.stringify(p.specs ?? {}) } },
   ];
 
-  await client.send(
+  await sendWithResumeRetry(
     new ExecuteStatementCommand({
       resourceArn: CLUSTER_ARN,
       secretArn: SECRET_ARN,
