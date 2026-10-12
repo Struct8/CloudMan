@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS produtos (
   categoria     text,
   descricao     text,
   preco         numeric(12,2),
+  imagem_url    text,
   specs         jsonb NOT NULL DEFAULT '{}'::jsonb,
   criado_em     timestamptz NOT NULL DEFAULT now(),
   atualizado_em timestamptz NOT NULL DEFAULT now(),
@@ -39,6 +40,9 @@ CREATE INDEX IF NOT EXISTS idx_produtos_fts
 -- Fuzzy: GIN trigram sobre o nome (habilita o operador % e similarity()).
 CREATE INDEX IF NOT EXISTS idx_produtos_nome_trgm
   ON produtos USING gin (nome gin_trgm_ops);
+
+-- Para uma tabela que ja existe, adicione a coluna de imagem sem recriar:
+ALTER TABLE produtos ADD COLUMN IF NOT EXISTS imagem_url text;
 
 -- Filtros comuns de catalogo.
 CREATE INDEX IF NOT EXISTS idx_produtos_categoria ON produtos (categoria);

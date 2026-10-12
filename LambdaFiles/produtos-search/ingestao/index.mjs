@@ -21,15 +21,16 @@ const DB_NAME = process.env.AWS_RDS_CLUSTER_DB_NAME_0 || "produtos";
 const client = new RDSDataClient({ region: REGION });
 
 const UPSERT_SQL = `
-  INSERT INTO produtos (id, nome, marca, categoria, descricao, preco, specs)
-  VALUES (:id, :nome, :marca, :categoria, :descricao, :preco, CAST(:specs AS jsonb))
+  INSERT INTO produtos (id, nome, marca, categoria, descricao, preco, imagem_url, specs)
+  VALUES (:id, :nome, :marca, :categoria, :descricao, :preco, :imagem_url, CAST(:specs AS jsonb))
   ON CONFLICT (id) DO UPDATE SET
-    nome      = EXCLUDED.nome,
-    marca     = EXCLUDED.marca,
-    categoria = EXCLUDED.categoria,
-    descricao = EXCLUDED.descricao,
-    preco     = EXCLUDED.preco,
-    specs     = EXCLUDED.specs,
+    nome       = EXCLUDED.nome,
+    marca      = EXCLUDED.marca,
+    categoria  = EXCLUDED.categoria,
+    descricao  = EXCLUDED.descricao,
+    preco      = EXCLUDED.preco,
+    imagem_url = EXCLUDED.imagem_url,
+    specs      = EXCLUDED.specs,
     atualizado_em = now();
 `;
 
@@ -46,6 +47,10 @@ async function upsertProduto(p) {
         p.preco == null
           ? { isNull: true }
           : { doubleValue: Number(p.preco) },
+    },
+    {
+      name: "imagem_url",
+      value: p.imagem_url ? { stringValue: String(p.imagem_url) } : { isNull: true },
     },
     { name: "specs", value: { stringValue: JSON.stringify(p.specs ?? {}) } },
   ];

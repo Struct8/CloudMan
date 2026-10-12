@@ -6,8 +6,9 @@
 // Lambda -> policy -> Aurora.
 //
 // Busca combinada:
-//   - Full-Text Search nativo (to_tsvector / websearch_to_tsquery) com ranking
+//   - Full-Text Search nativo (websearch_to_tsquery) com ranking
 //   - pg_trgm (similarity) como fallback tolerante a erro de digitacao
+//   - sem termo (q vazio): devolve produtos em destaque (mais recentes)
 //
 // Rota: GET /busca?q=<termo>&limit=<n>
 
@@ -23,26 +24,43 @@ const DB_NAME = process.env.AWS_RDS_CLUSTER_DB_NAME_0 || "produtos";
 
 const client = new RDSDataClient({ region: REGION });
 
-// Executa um SQL parametrizado via Data API e devolve as linhas ja em objetos.
-async function query(sql, parameters = []) {
-  const command = new ExecuteStatementCommand({
-    resourceArn: CLUSTER_ARN,
-    secretArn: SECRET_ARN,
-    database: DB_NAME,
-    sql,
-    parameters,
-    includeResultMetadata: true,
-  });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  const res = await client.send(command);
-  const cols = (res.columnMetadata || []).map((c) => c.name);
-  return (res.records || []).map((row) => {
-    const obj = {};
-    row.forEach((field, i) => {
-      obj[cols[i]] = unwrap(field);
-    });
-    return obj;
-  });
+// Executa um SQL parametrizado via Data API, com retry enquanto o Aurora
+// Serverless v2 esta "acordando" do auto-pause (DatabaseResumingException).
+// Sem isso, a primeira requisicao depois de ocioso vira erro 500.
+async function query(sql, parameters = [], { retries = 5, delayMs = 1500 } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const res = await client.send(
+        new ExecuteStatementCommand({
+          resourceArn: CLUSTER_ARN,
+          secretArn: SECRET_ARN,
+          database: DB_NAME,
+          sql,
+          parameters,
+          includeResultMetadata: true,
+        })
+      );
+      const cols = (res.columnMetadata || []).map((c) => c.name);
+      return (res.records || []).map((row) => {
+        const obj = {};
+        row.forEach((field, i) => {
+          obj[cols[i]] = unwrap(field);
+        });
+        return obj;
+      });
+    } catch (err) {
+      const resuming =
+        err?.name === "DatabaseResumingException" ||
+        /resuming after being auto-paused/i.test(err?.message || "");
+      if (resuming && attempt < retries) {
+        await sleep(delayMs);
+        continue;
+      }
+      throw err;
+    }
+  }
 }
 
 // Converte o Field do Data API no valor JS correspondente.
@@ -68,49 +86,57 @@ function response(statusCode, body) {
   };
 }
 
+const COLS = "id, nome, marca, categoria, descricao, preco, imagem_url";
+
 export const handler = async (event) => {
   const params = (event && event.queryStringParameters) || {};
   const termo = (params.q || "").trim();
-  const limit = Math.min(parseInt(params.limit, 10) || 20, 50);
+  const limit = Math.min(parseInt(params.limit, 10) || 24, 50);
 
-  if (!termo) {
-    return response(400, { error: "parametro 'q' obrigatorio" });
-  }
+  // Sem termo: vitrine de destaques (produtos mais recentes).
+  const destaquesSql = `
+    SELECT ${COLS}, 0::real AS rank
+    FROM produtos
+    ORDER BY criado_em DESC
+    LIMIT :limit;
+  `;
 
-  // 1) FTS com ranking. websearch_to_tsquery entende "notebook i7 16gb".
-  // 2) Se o FTS nao achar nada, cai para similaridade por trigram (typos).
-  const sql = `
+  // Com termo: FTS com ranking; fallback trigram quando o FTS nao acha nada.
+  const buscaSql = `
     WITH fts AS (
-      SELECT
-        id, nome, marca, categoria, preco,
+      SELECT ${COLS},
         ts_rank(search_vector, websearch_to_tsquery('portuguese', :termo)) AS rank,
         1 AS fonte
       FROM produtos
       WHERE search_vector @@ websearch_to_tsquery('portuguese', :termo)
     ),
     trgm AS (
-      SELECT
-        id, nome, marca, categoria, preco,
+      SELECT ${COLS},
         similarity(nome, :termo) AS rank,
         2 AS fonte
       FROM produtos
       WHERE NOT EXISTS (SELECT 1 FROM fts)
         AND nome % :termo
     )
-    SELECT id, nome, marca, categoria, preco, rank
+    SELECT ${COLS}, rank
     FROM (SELECT * FROM fts UNION ALL SELECT * FROM trgm) r
     ORDER BY fonte, rank DESC
     LIMIT :limit;
   `;
 
-  const parameters = [
-    { name: "termo", value: { stringValue: termo } },
-    { name: "limit", value: { longValue: limit } },
-  ];
-
   try {
-    const produtos = await query(sql, parameters);
-    return response(200, { termo, total: produtos.length, produtos });
+    let produtos;
+    if (!termo) {
+      produtos = await query(destaquesSql, [
+        { name: "limit", value: { longValue: limit } },
+      ]);
+      return response(200, { termo: "", destaque: true, total: produtos.length, produtos });
+    }
+    produtos = await query(buscaSql, [
+      { name: "termo", value: { stringValue: termo } },
+      { name: "limit", value: { longValue: limit } },
+    ]);
+    return response(200, { termo, destaque: false, total: produtos.length, produtos });
   } catch (err) {
     console.error("erro na busca", err);
     return response(500, { error: "falha ao consultar produtos" });

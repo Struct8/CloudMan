@@ -1,0 +1,13 @@
+{
+  "name": "produtos-lambda-publisher",
+  "version": "1.0.0",
+  "description": "Recebe POST /produtos e publica na SQS para ingestao",
+  "type": "module",
+  "main": "index.mjs",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.670.0"
+  }
+}
