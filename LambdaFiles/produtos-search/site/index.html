@@ -180,14 +180,31 @@
         </div>`;
     }
 
-    async function load(term) {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    async function load(term, attempt = 0) {
       skeletons();
-      statusEl.textContent = term ? "Searching…" : "Loading featured…";
+      // The Aurora Serverless v2 database auto-pauses when idle. The first
+      // request after idle gets a 503 {resuming:true} while it wakes up —
+      // we show a message and keep retrying until it's up (lab-friendly).
+      statusEl.textContent =
+        attempt > 0
+          ? "⏳ Waking up the database… please wait"
+          : term ? "Searching…" : "Loading featured…";
       btn.disabled = true;
       try {
         const url = term ? `${API}?q=${encodeURIComponent(term)}` : API;
         const res = await fetch(url);
+
+        if (res.status === 503) {
+          const info = await res.json().catch(() => ({}));
+          if (info.resuming && attempt < 15) {
+            await sleep(3000);
+            return load(term, attempt + 1); // retry while the DB resumes
+          }
+        }
         if (!res.ok) throw new Error("HTTP " + res.status);
+
         const data = await res.json();
         const products = data.produtos || [];
         sectionTitle.textContent = data.destaque ? "Featured" : "Results";

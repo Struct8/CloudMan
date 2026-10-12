@@ -28,8 +28,24 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Executa um SQL parametrizado via Data API, com retry enquanto o Aurora
 // Serverless v2 esta "acordando" do auto-pause (DatabaseResumingException).
-// Sem isso, a primeira requisicao depois de ocioso vira erro 500.
-async function query(sql, parameters = [], { retries = 5, delayMs = 1500 } = {}) {
+// Marca de erro para "o banco esta acordando do auto-pause".
+class ResumingError extends Error {
+  constructor() { super("database resuming"); this.name = "ResumingError"; }
+}
+
+function isResuming(err) {
+  return (
+    err?.name === "DatabaseResumingException" ||
+    /resuming after being auto-paused/i.test(err?.message || "")
+  );
+}
+
+// Faz POUCAS tentativas rapidas (absorve um resuming muito curto). Se o banco
+// ainda estiver acordando, lanca ResumingError: o handler responde 503
+// {resuming:true}, e o SITE mostra "aguarde a base subir" e tenta de novo.
+// (Didatico para o lab: expoe o cold start do Aurora Serverless v2 em vez de
+// esconder atras de um retry longo.)
+async function query(sql, parameters = [], { retries = 2, delayMs = 1000 } = {}) {
   for (let attempt = 0; ; attempt++) {
     try {
       const res = await client.send(
@@ -51,12 +67,12 @@ async function query(sql, parameters = [], { retries = 5, delayMs = 1500 } = {})
         return obj;
       });
     } catch (err) {
-      const resuming =
-        err?.name === "DatabaseResumingException" ||
-        /resuming after being auto-paused/i.test(err?.message || "");
-      if (resuming && attempt < retries) {
-        await sleep(delayMs);
-        continue;
+      if (isResuming(err)) {
+        if (attempt < retries) {
+          await sleep(delayMs);
+          continue;
+        }
+        throw new ResumingError();
       }
       throw err;
     }
@@ -75,12 +91,13 @@ function unwrap(field) {
   return null;
 }
 
-function response(statusCode, body) {
+function response(statusCode, body, extraHeaders = {}) {
   return {
     statusCode,
     headers: {
       "content-type": "application/json; charset=utf-8",
-      "cache-control": "public, max-age=30",
+      "cache-control": "no-store",
+      ...extraHeaders,
     },
     body: JSON.stringify(body),
   };
@@ -138,6 +155,12 @@ export const handler = async (event) => {
     ]);
     return response(200, { termo, destaque: false, total: produtos.length, produtos });
   } catch (err) {
+    if (err?.name === "ResumingError") {
+      // Banco acordando do auto-pause: o site mostra "aguarde a base subir"
+      // e repete a chamada. 503 + Retry-After como dica.
+      console.warn("aurora resuming; pedindo retry ao cliente");
+      return response(503, { resuming: true, error: "database is resuming" }, { "retry-after": "3" });
+    }
     console.error("erro na busca", err);
     return response(500, { error: "falha ao consultar produtos" });
   }
