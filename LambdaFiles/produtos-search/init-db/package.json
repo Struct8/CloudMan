@@ -1,0 +1,13 @@
+{
+  "name": "produtos-lambda-init-db",
+  "version": "1.0.0",
+  "description": "Inicializa o schema e popula produtos de exemplo apos o apply",
+  "type": "module",
+  "main": "index.mjs",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@aws-sdk/client-rds-data": "^3.670.0"
+  }
+}
