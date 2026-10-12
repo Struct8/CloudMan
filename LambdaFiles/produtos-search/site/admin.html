@@ -41,6 +41,8 @@
     button:disabled { opacity: .6; cursor: default; }
     .msg { font-size: .9rem; }
     .msg.ok { color: var(--ok); } .msg.err { color: #f87171; }
+    .hint { font-size: .78rem; color: var(--muted); min-height: 1rem; }
+    .hint.err { color: #f87171; }
     .preview { grid-column: 1/-1; margin-top: .5rem; display: none; }
     .preview img { max-height: 120px; border-radius: 10px; border: 1px solid var(--border); }
   </style>
@@ -75,8 +77,10 @@
         <input id="preco" type="number" step="0.01" min="0" placeholder="999.90" />
       </div>
       <div class="field full">
-        <label for="imagem_url">Image URL</label>
-        <input id="imagem_url" type="url" placeholder="https://…/product.jpg" />
+        <label for="file">Product image</label>
+        <input id="file" type="file" accept="image/*" />
+        <span class="hint" id="uploadMsg"></span>
+        <input id="imagem_url" type="hidden" />
       </div>
       <div class="field full">
         <label for="descricao">Description</label>
@@ -92,22 +96,69 @@
 
   <script>
     const API = "/produtos";
+    const UPLOAD_API = "/upload-url";
     const form = document.getElementById("form");
     const btn = document.getElementById("btn");
     const msg = document.getElementById("msg");
-    const imgInput = document.getElementById("imagem_url");
+    const fileInput = document.getElementById("file");
+    const uploadMsg = document.getElementById("uploadMsg");
+    const imgInput = document.getElementById("imagem_url"); // hidden, holds the final URL
     const preview = document.getElementById("preview");
     const previewImg = document.getElementById("previewImg");
 
-    imgInput.addEventListener("input", () => {
-      const u = imgInput.value.trim();
-      if (u) { previewImg.src = u; preview.style.display = "block"; }
-      else { preview.style.display = "none"; }
+    let uploading = false;
+
+    // When a file is chosen: ask for a presigned URL, PUT the file to S3,
+    // then store the public (CloudFront) URL in the hidden imagem_url field.
+    fileInput.addEventListener("change", async () => {
+      const file = fileInput.files && fileInput.files[0];
+      imgInput.value = "";
+      preview.style.display = "none";
+      if (!file) { uploadMsg.textContent = ""; return; }
+
+      if (!file.type.startsWith("image/")) {
+        uploadMsg.textContent = "Please choose an image file."; uploadMsg.className = "hint err"; return;
+      }
+      if (file.size > 5 * 1024 * 1024) {
+        uploadMsg.textContent = "Image too large (max 5MB)."; uploadMsg.className = "hint err"; return;
+      }
+
+      // Local preview immediately.
+      previewImg.src = URL.createObjectURL(file);
+      preview.style.display = "block";
+
+      uploading = true; btn.disabled = true;
+      uploadMsg.textContent = "Uploading image…"; uploadMsg.className = "hint";
+      try {
+        // 1) ask the API for a presigned PUT URL
+        const q = `${UPLOAD_API}?filename=${encodeURIComponent(file.name)}&type=${encodeURIComponent(file.type)}`;
+        const presignRes = await fetch(q);
+        const presign = await presignRes.json().catch(() => ({}));
+        if (!presignRes.ok) throw new Error(presign.error || ("HTTP " + presignRes.status));
+
+        // 2) PUT the file straight to S3
+        const putRes = await fetch(presign.uploadUrl, {
+          method: "PUT",
+          headers: { "content-type": file.type },
+          body: file,
+        });
+        if (!putRes.ok) throw new Error("upload failed (HTTP " + putRes.status + ")");
+
+        // 3) keep the public URL for the product submit
+        imgInput.value = presign.publicUrl;
+        uploadMsg.textContent = "✓ Image ready."; uploadMsg.className = "hint";
+      } catch (err) {
+        uploadMsg.textContent = "Image upload error: " + err.message; uploadMsg.className = "hint err";
+        preview.style.display = "none";
+      } finally {
+        uploading = false; btn.disabled = false;
+      }
     });
 
     // Field keys stay in their original names (the API contract): nome, marca, categoria, preco, imagem_url, descricao.
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
+      if (uploading) { msg.textContent = "Wait for the image upload to finish."; msg.className = "msg err"; return; }
       const product = {
         nome: document.getElementById("nome").value.trim(),
         marca: document.getElementById("marca").value.trim(),
@@ -127,7 +178,7 @@
         if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
         msg.textContent = "✓ Added! (id " + (data.id || "?") + ")";
         msg.className = "msg ok";
-        form.reset(); preview.style.display = "none";
+        form.reset(); preview.style.display = "none"; uploadMsg.textContent = "";
       } catch (err) {
         msg.textContent = "Error: " + err.message;
         msg.className = "msg err";
