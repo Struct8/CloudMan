@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HardStore — Admin</title>
+  <style>
+    :root {
+      --bg: #0b1020; --bg-soft: #151c32; --card: #1a2238; --border: #273150;
+      --text: #e8edf7; --muted: #93a1c0; --brand: #4f8cff; --brand-2: #22d3ee; --ok: #34d399;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text);
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; min-height: 100vh; }
+    .topbar { border-bottom: 1px solid var(--border); background: rgba(11,16,32,.85); }
+    .topbar-inner { max-width: 760px; margin: 0 auto; padding: .9rem 1.25rem; display: flex; align-items: center; gap: 1rem; }
+    .logo { display: flex; align-items: center; gap: .6rem; font-weight: 800; font-size: 1.2rem; }
+    .logo .mark { width: 30px; height: 30px; border-radius: 8px;
+      background: linear-gradient(135deg, var(--brand), var(--brand-2)); display: grid; place-items: center; }
+    .logo .pro { color: var(--brand-2); }
+    .back { margin-left: auto; font-size: .85rem; color: var(--muted); text-decoration: none;
+      border: 1px solid var(--border); padding: .45rem .8rem; border-radius: 10px; }
+    .wrap { max-width: 760px; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+    h1 { font-size: 1.5rem; margin: 0 0 .3rem; }
+    .sub { color: var(--muted); margin: 0 0 1.5rem; font-size: .9rem; }
+    form { display: grid; gap: 1rem; grid-template-columns: 1fr 1fr; }
+    .field { display: flex; flex-direction: column; gap: .35rem; }
+    .field.full { grid-column: 1 / -1; }
+    label { font-size: .8rem; color: var(--muted); }
+    input, textarea {
+      padding: .7rem .85rem; font-size: .95rem; color: var(--text);
+      background: var(--bg-soft); border: 1px solid var(--border); border-radius: 10px; font-family: inherit;
+    }
+    input:focus, textarea:focus { outline: none; border-color: var(--brand); }
+    textarea { resize: vertical; min-height: 70px; }
+    .row-actions { grid-column: 1 / -1; display: flex; align-items: center; gap: 1rem; }
+    button {
+      padding: .8rem 1.5rem; font-size: 1rem; font-weight: 700; cursor: pointer; color: #04122b;
+      border: 0; border-radius: 10px; background: linear-gradient(135deg, var(--brand), var(--brand-2));
+    }
+    button:disabled { opacity: .6; cursor: default; }
+    .msg { font-size: .9rem; }
+    .msg.ok { color: var(--ok); } .msg.err { color: #f87171; }
+    .preview { grid-column: 1/-1; margin-top: .5rem; display: none; }
+    .preview img { max-height: 120px; border-radius: 10px; border: 1px solid var(--border); }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="logo"><span class="mark">⚡</span> Hard<span class="pro">Store</span></div>
+      <a class="back" href="/">← Loja</a>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <h1>Adicionar produto</h1>
+    <p class="sub">O produto entra na fila e aparece na loja em instantes (processamento assíncrono).</p>
+
+    <form id="form">
+      <div class="field">
+        <label for="nome">Nome *</label>
+        <input id="nome" required placeholder="Notebook Dell Inspiron i7 16GB" />
+      </div>
+      <div class="field">
+        <label for="marca">Marca</label>
+        <input id="marca" placeholder="Dell" />
+      </div>
+      <div class="field">
+        <label for="categoria">Categoria</label>
+        <input id="categoria" placeholder="notebook" />
+      </div>
+      <div class="field">
+        <label for="preco">Preço (R$)</label>
+        <input id="preco" type="number" step="0.01" min="0" placeholder="4999.90" />
+      </div>
+      <div class="field full">
+        <label for="imagem_url">URL da imagem</label>
+        <input id="imagem_url" type="url" placeholder="https://…/produto.jpg" />
+      </div>
+      <div class="field full">
+        <label for="descricao">Descrição</label>
+        <textarea id="descricao" placeholder="Notebook para trabalho e estudo, SSD 512GB…"></textarea>
+      </div>
+      <div class="preview" id="preview"><img id="previewImg" alt="preview" /></div>
+      <div class="row-actions">
+        <button id="btn" type="submit">Adicionar à loja</button>
+        <span class="msg" id="msg"></span>
+      </div>
+    </form>
+  </main>
+
+  <script>
+    const API = "/produtos";
+    const form = document.getElementById("form");
+    const btn = document.getElementById("btn");
+    const msg = document.getElementById("msg");
+    const imgInput = document.getElementById("imagem_url");
+    const preview = document.getElementById("preview");
+    const previewImg = document.getElementById("previewImg");
+
+    imgInput.addEventListener("input", () => {
+      const u = imgInput.value.trim();
+      if (u) { previewImg.src = u; preview.style.display = "block"; }
+      else { preview.style.display = "none"; }
+    });
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const produto = {
+        nome: document.getElementById("nome").value.trim(),
+        marca: document.getElementById("marca").value.trim(),
+        categoria: document.getElementById("categoria").value.trim(),
+        preco: document.getElementById("preco").value,
+        imagem_url: imgInput.value.trim(),
+        descricao: document.getElementById("descricao").value.trim(),
+      };
+      msg.textContent = "Enviando…"; msg.className = "msg"; btn.disabled = true;
+      try {
+        const res = await fetch(API, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(produto),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+        msg.textContent = "✓ Adicionado! (id " + (data.id || "?") + ")";
+        msg.className = "msg ok";
+        form.reset(); preview.style.display = "none";
+      } catch (err) {
+        msg.textContent = "Erro: " + err.message;
+        msg.className = "msg err";
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
