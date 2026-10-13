@@ -77,26 +77,29 @@ const SCHEMA = [
   `CREATE INDEX IF NOT EXISTS idx_produtos_preco ON produtos (preco)`,
 ];
 
-// Produtos de exemplo (ingles, imagens diretas do Unsplash).
+// Produtos de exemplo. As imagens sao SVGs versionados no repo (site/img/seed/),
+// publicados no bucket pelo aws_s3_object e servidos pelo CloudFront no mesmo
+// dominio (/img/seed/...). Sem dependencia de sites externos: o template e
+// autossuficiente.
 const SEED = [
   { id: "seed-laptop", nome: "Dell XPS 13 Laptop i7 16GB", marca: "Dell", categoria: "laptop",
     descricao: "Premium ultrabook with InfinityEdge display, 512GB NVMe SSD", preco: 1399.00,
-    imagem_url: "https://images.unsplash.com/photo-1496181133206-80ce9b88a853?w=600" },
+    imagem_url: "/img/seed/laptop.svg" },
   { id: "seed-monitor", nome: "LG UltraWide 34\" Monitor", marca: "LG", categoria: "monitor",
     descricao: "34-inch QHD IPS ultrawide, 144Hz, USB-C", preco: 549.90,
-    imagem_url: "https://images.unsplash.com/photo-1527443224154-c4a3942d3acf?w=600" },
+    imagem_url: "/img/seed/monitor.svg" },
   { id: "seed-keyboard", nome: "Mechanical Keyboard RGB", marca: "Keychron", categoria: "keyboard",
     descricao: "Hot-swappable mechanical keyboard, brown switches", preco: 109.90,
-    imagem_url: "https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=600" },
+    imagem_url: "/img/seed/keyboard.svg" },
   { id: "seed-mouse", nome: "Logitech MX Master 3S", marca: "Logitech", categoria: "mouse",
     descricao: "Wireless performance mouse, 8K DPI, quiet clicks", preco: 99.90,
-    imagem_url: "https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=600" },
+    imagem_url: "/img/seed/mouse.svg" },
   { id: "seed-ssd", nome: "Samsung 990 PRO 2TB NVMe SSD", marca: "Samsung", categoria: "storage",
     descricao: "PCIe 4.0 NVMe M.2, up to 7450 MB/s", preco: 169.90,
-    imagem_url: "https://images.unsplash.com/photo-1597872200969-2b65d56bd16b?w=600" },
+    imagem_url: "/img/seed/storage.svg" },
   { id: "seed-gpu", nome: "NVIDIA GeForce RTX 4070 GPU", marca: "NVIDIA", categoria: "graphics card",
     descricao: "12GB GDDR6X, ray tracing, DLSS 3", preco: 599.00,
-    imagem_url: "https://images.unsplash.com/photo-1591488320449-011701bb6704?w=600" },
+    imagem_url: "/img/seed/gpu.svg" },
 ];
 
 const UPSERT = `
