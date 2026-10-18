@@ -141,6 +141,11 @@ Resources:
   TerraformStateBucket:
     Type: AWS::S3::Bucket
     Condition: ShouldCreateS3
+    # Not a parameter on purpose: nothing a user sets on this stack can make it delete
+    # or replace the bucket that holds the Terraform state. Deleting the stack, turning
+    # CreateS3Bucket off or changing S3BucketName leaves the bucket and its objects.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Ref S3BucketName
       VersioningConfiguration:
@@ -166,6 +171,8 @@ Resources:
   TerraformStateLockTable:
     Type: AWS::DynamoDB::Table
     Condition: ShouldCreateDynamoDB
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Ref DynamoDBTableName
       AttributeDefinitions:
@@ -331,6 +338,16 @@ Resources:
                   - "cloudtrail:UpdateTrail"
                   - "cloudtrail:PutEventSelectors"
                 Resource: "*"
+              # The state bucket cannot be deleted by a run that uses this role, whatever
+              # the workspace's Terraform says. Objects stay manageable: Terraform deletes
+              # state objects of its own workspaces.
+              - !If
+                - ShouldCreateS3
+                - Effect: Deny
+                  Action:
+                    - "s3:DeleteBucket"
+                  Resource: !Sub "arn:aws:s3:::${S3BucketName}"
+                - !Ref AWS::NoValue
       Tags:
         - Key: Name
           Value: !Ref IAMRoleName
