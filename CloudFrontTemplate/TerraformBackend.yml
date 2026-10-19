@@ -18,14 +18,37 @@ Parameters:
 
   # --- S3 CONFIGURATION ---
   CreateS3Bucket:
-    Description: "Do you want to create the S3 bucket? (true/false)."
+    Description: >-
+      Create the S3 bucket named in S3BucketName (true/false). Choose false when the
+      bucket already exists, such as a bucket that already holds Terraform state.
     Type: String
     Default: "true"
     AllowedValues: ["true", "false"]
 
   S3BucketName:
-    Description: "Name of the S3 bucket (Required if CreateS3Bucket is true. Must be globally unique)."
+    Description: >-
+      Name of the S3 bucket that holds the Terraform state. Bucket names are unique
+      across AWS. With CreateS3Bucket set to false, the bucket must already exist. The
+      deploy role cannot delete this bucket whether or not this stack created it.
     Type: String
+
+  S3LifecycleNoncurrentDays:
+    Description: >-
+      Days after which a version of an object that is no longer the current one is
+      deleted from the bucket this stack creates. Empty means no lifecycle rule and
+      every version is kept. Has no effect on a bucket this stack does not create.
+    Type: String
+    Default: ""
+    AllowedPattern: "^([1-9][0-9]{0,4})?$"
+
+  S3LifecycleKeepNewerVersions:
+    Description: >-
+      How many of the most recent noncurrent versions of an object are kept even
+      when they are older than S3LifecycleNoncurrentDays (1 to 100). Empty keeps none
+      beyond that age. Only read when S3LifecycleNoncurrentDays is set.
+    Type: String
+    Default: ""
+    AllowedPattern: "^(100|[1-9][0-9]?)?$"
 
   # --- DYNAMODB CONFIGURATION ---
   CreateDynamoDBTable:
@@ -113,6 +136,9 @@ Parameters:
 
 Conditions:
   ShouldCreateS3: !Equals [ !Ref CreateS3Bucket, "true" ]
+  HasS3BucketName: !Not [ !Equals [ !Ref S3BucketName, "" ] ]
+  HasNoncurrentLifecycle: !Not [ !Equals [ !Ref S3LifecycleNoncurrentDays, "" ] ]
+  HasKeepNewerVersions: !Not [ !Equals [ !Ref S3LifecycleKeepNewerVersions, "" ] ]
   ShouldCreateDynamoDB: !Equals [ !Ref CreateDynamoDBTable, "true" ]
   ShouldCreateOIDC: !Equals [ !Ref CreateOIDCProvider, "true" ]
   ShouldRequireEngineWorkflow: !Equals [ !Ref RequireEngineWorkflow, "true" ]
@@ -141,6 +167,11 @@ Resources:
   TerraformStateBucket:
     Type: AWS::S3::Bucket
     Condition: ShouldCreateS3
+    # Not a parameter on purpose: nothing a user sets on this stack can make it delete
+    # or replace the bucket that holds the Terraform state. Deleting the stack, turning
+    # CreateS3Bucket off or changing S3BucketName leaves the bucket and its objects.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Ref S3BucketName
       VersioningConfiguration:
@@ -154,6 +185,18 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      LifecycleConfiguration: !If
+        - HasNoncurrentLifecycle
+        - Rules:
+            - Id: expire-noncurrent-versions
+              Status: Enabled
+              NoncurrentVersionExpiration:
+                NoncurrentDays: !Ref S3LifecycleNoncurrentDays
+                NewerNoncurrentVersions: !If
+                  - HasKeepNewerVersions
+                  - !Ref S3LifecycleKeepNewerVersions
+                  - !Ref "AWS::NoValue"
+        - !Ref "AWS::NoValue"
       Tags:
         - Key: Name
           Value: !Ref S3BucketName
@@ -166,6 +209,8 @@ Resources:
   TerraformStateLockTable:
     Type: AWS::DynamoDB::Table
     Condition: ShouldCreateDynamoDB
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Ref DynamoDBTableName
       AttributeDefinitions:
@@ -331,6 +376,17 @@ Resources:
                   - "cloudtrail:UpdateTrail"
                   - "cloudtrail:PutEventSelectors"
                 Resource: "*"
+              # The state bucket cannot be deleted by a run that uses this role, whatever
+              # the workspace's Terraform says, including a bucket that existed before
+              # this stack (CreateS3Bucket false). Objects stay manageable: Terraform
+              # deletes state objects of its own workspaces.
+              - !If
+                - HasS3BucketName
+                - Effect: Deny
+                  Action:
+                    - "s3:DeleteBucket"
+                  Resource: !Sub "arn:aws:s3:::${S3BucketName}"
+                - !Ref AWS::NoValue
       Tags:
         - Key: Name
           Value: !Ref IAMRoleName
