@@ -18,13 +18,18 @@ Parameters:
 
   # --- S3 CONFIGURATION ---
   CreateS3Bucket:
-    Description: "Do you want to create the S3 bucket? (true/false)."
+    Description: >-
+      Create the S3 bucket named in S3BucketName (true/false). Choose false when the
+      bucket already exists, such as a bucket that already holds Terraform state.
     Type: String
     Default: "true"
     AllowedValues: ["true", "false"]
 
   S3BucketName:
-    Description: "Name of the S3 bucket (Required if CreateS3Bucket is true. Must be globally unique)."
+    Description: >-
+      Name of the S3 bucket that holds the Terraform state. Bucket names are unique
+      across AWS. With CreateS3Bucket set to false, the bucket must already exist. The
+      deploy role cannot delete this bucket whether or not this stack created it.
     Type: String
 
   # --- DYNAMODB CONFIGURATION ---
@@ -113,6 +118,7 @@ Parameters:
 
 Conditions:
   ShouldCreateS3: !Equals [ !Ref CreateS3Bucket, "true" ]
+  HasS3BucketName: !Not [ !Equals [ !Ref S3BucketName, "" ] ]
   ShouldCreateDynamoDB: !Equals [ !Ref CreateDynamoDBTable, "true" ]
   ShouldCreateOIDC: !Equals [ !Ref CreateOIDCProvider, "true" ]
   ShouldRequireEngineWorkflow: !Equals [ !Ref RequireEngineWorkflow, "true" ]
@@ -339,10 +345,11 @@ Resources:
                   - "cloudtrail:PutEventSelectors"
                 Resource: "*"
               # The state bucket cannot be deleted by a run that uses this role, whatever
-              # the workspace's Terraform says. Objects stay manageable: Terraform deletes
-              # state objects of its own workspaces.
+              # the workspace's Terraform says, including a bucket that existed before
+              # this stack (CreateS3Bucket false). Objects stay manageable: Terraform
+              # deletes state objects of its own workspaces.
               - !If
-                - ShouldCreateS3
+                - HasS3BucketName
                 - Effect: Deny
                   Action:
                     - "s3:DeleteBucket"
