@@ -2,7 +2,9 @@
 # (AgentV2.GenerateConnectionLinkTerraformBackend).
 #
 # PUBLISHED AT:
-#   s3://struct8-public-cloudformation-templates/TerraformBackend.yml
+#   s3://struct8-gitops-backend-templates/templates/TerraformBackend.yml
+# A private bucket: AgentV2 hands the customer's console a signed link to it, and
+# writes update templates with parameters pinned under generated/ in the same bucket.
 # Editing this file changes nothing until that object is replaced.
 #
 # Blast radius of a change here: new stacks only. An account onboarded earlier keeps
@@ -50,6 +52,34 @@ Parameters:
     Default: ""
     AllowedPattern: "^(100|[1-9][0-9]?)?$"
 
+  S3KmsKey:
+    Description: >-
+      The KMS key that encrypts new objects in the bucket this stack creates. Empty
+      means SSE-S3 (AES256), at no cost. stack means the key this stack creates. Or
+      the ARN of a customer managed key, enabled, symmetric and in the same region.
+      Objects already in the bucket keep the encryption they were written with. Has
+      no effect on a bucket this stack does not create.
+    Type: String
+    Default: ""
+    AllowedPattern: "^(stack|arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+)?$"
+
+  # --- KMS KEY CREATED BY THIS STACK ---
+  BackendKmsKeyName:
+    Description: >-
+      Name tag of the KMS key this stack creates. The key is created only while
+      S3KmsKey or DynamoDBKmsKey is set to stack.
+    Type: String
+    Default: ""
+    AllowedPattern: "^[A-Za-z0-9 _.:/=+@-]{0,256}$"
+
+  BackendKmsKeyAlias:
+    Description: >-
+      Alias of the KMS key this stack creates, such as alias/backend-key-1a2b3c4d.
+      Terraform states find the key by this alias.
+    Type: String
+    Default: ""
+    AllowedPattern: "^(alias/[A-Za-z0-9_-]{1,250})?$"
+
   # --- DYNAMODB CONFIGURATION ---
   CreateDynamoDBTable:
     Description: "Do you want to create the DynamoDB table for State Locking? (true/false)."
@@ -61,6 +91,25 @@ Parameters:
     Description: "Name of the DynamoDB table."
     Type: String
     Default: "terraform-state-lock"
+
+  DynamoDBDeletionProtection:
+    Description: >-
+      Turn on deletion protection for the lock table this stack creates (true/false).
+      While it is on, nobody can delete the table, this stack included, until it is
+      turned off. Has no effect on a table this stack does not create.
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+
+  DynamoDBKmsKey:
+    Description: >-
+      The KMS key that encrypts the lock table this stack creates. Empty means the
+      AWS owned key, at no cost. stack means the key this stack creates. Or the ARN
+      of a customer managed key, enabled, symmetric and in the same region. Has no
+      effect on a table this stack does not create.
+    Type: String
+    Default: ""
+    AllowedPattern: "^(stack|arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+)?$"
 
   # --- GITHUB & OIDC CONFIGURATION ---
   CreateOIDCProvider:
@@ -140,6 +189,14 @@ Conditions:
   HasNoncurrentLifecycle: !Not [ !Equals [ !Ref S3LifecycleNoncurrentDays, "" ] ]
   HasKeepNewerVersions: !Not [ !Equals [ !Ref S3LifecycleKeepNewerVersions, "" ] ]
   ShouldCreateDynamoDB: !Equals [ !Ref CreateDynamoDBTable, "true" ]
+  HasS3KmsKey: !Not [ !Equals [ !Ref S3KmsKey, "" ] ]
+  S3UsesBackendKmsKey: !Equals [ !Ref S3KmsKey, "stack" ]
+  HasDynamoDBKmsKey: !Not [ !Equals [ !Ref DynamoDBKmsKey, "" ] ]
+  DynamoDBUsesBackendKmsKey: !Equals [ !Ref DynamoDBKmsKey, "stack" ]
+  # The key exists only while a bucket or a table this stack creates uses it.
+  ShouldCreateBackendKmsKey: !Or
+    - !And [ !Condition ShouldCreateS3, !Condition S3UsesBackendKmsKey ]
+    - !And [ !Condition ShouldCreateDynamoDB, !Condition DynamoDBUsesBackendKmsKey ]
   ShouldCreateOIDC: !Equals [ !Ref CreateOIDCProvider, "true" ]
   ShouldRequireEngineWorkflow: !Equals [ !Ref RequireEngineWorkflow, "true" ]
   HasSubjectRepoSegment: !Not [ !Equals [ !Ref SubjectRepoSegment, "" ] ]
@@ -183,8 +240,19 @@ Resources:
         RestrictPublicBuckets: true
       BucketEncryption:
         ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
+          - !If
+            - HasS3KmsKey
+            # S3 Bucket Key: one data key per bucket instead of one KMS call per
+            # object, which keeps the KMS request cost of Terraform's reads near zero.
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: aws:kms
+                KMSMasterKeyID: !If
+                  - S3UsesBackendKmsKey
+                  - !GetAtt BackendKmsKey.Arn
+                  - !Ref S3KmsKey
+              BucketKeyEnabled: true
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
       LifecycleConfiguration: !If
         - HasNoncurrentLifecycle
         - Rules:
@@ -219,7 +287,19 @@ Resources:
       KeySchema:
         - AttributeName: LockID
           KeyType: HASH
+      # Fixed on purpose: Terraform's lock writes one item keyed by LockID per run, so
+      # on-demand billing costs cents and the key cannot be anything else.
       BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: !Ref DynamoDBDeletionProtection
+      SSESpecification: !If
+        - HasDynamoDBKmsKey
+        - SSEEnabled: true
+          SSEType: KMS
+          KMSMasterKeyId: !If
+            - DynamoDBUsesBackendKmsKey
+            - !GetAtt BackendKmsKey.Arn
+            - !Ref DynamoDBKmsKey
+        - !Ref "AWS::NoValue"
       Tags:
         - Key: Name
           Value: !Ref DynamoDBTableName
@@ -227,6 +307,44 @@ Resources:
           Value: !Ref UserName
         - Key: State
           Value: !Ref "AWS::StackName"
+
+  # 3b. KMS key for the state bucket and the lock table (Optional)
+  BackendKmsKey:
+    Type: AWS::KMS::Key
+    Condition: ShouldCreateBackendKmsKey
+    # Retained like the bucket: state objects written with this key cannot be read
+    # without it, so nothing a user sets on this stack schedules its deletion.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Encrypts the Terraform state bucket and lock table of this stack.
+      EnableKeyRotation: true
+      # The key policy AWS gives a key by default: the account controls the key
+      # through IAM, so the deploy role and the account's administrators can use it.
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountControlsKeyThroughIam
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Ref BackendKmsKeyName
+        - Key: Struct8User
+          Value: !Ref UserName
+        - Key: State
+          Value: !Ref "AWS::StackName"
+
+  # The name Terraform states use to find the key (data "aws_kms_key").
+  BackendKmsKeyAliasResource:
+    Type: AWS::KMS::Alias
+    Condition: ShouldCreateBackendKmsKey
+    Properties:
+      AliasName: !Ref BackendKmsKeyAlias
+      TargetKeyId: !Ref BackendKmsKey
 
   # 4. IAM Role for GitHub Actions (Always created)
   GitHubActionsRole:
