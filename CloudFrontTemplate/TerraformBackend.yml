@@ -32,6 +32,24 @@ Parameters:
       deploy role cannot delete this bucket whether or not this stack created it.
     Type: String
 
+  S3LifecycleNoncurrentDays:
+    Description: >-
+      Days after which a version of an object that is no longer the current one is
+      deleted from the bucket this stack creates. Empty means no lifecycle rule and
+      every version is kept. Has no effect on a bucket this stack does not create.
+    Type: String
+    Default: ""
+    AllowedPattern: "^([1-9][0-9]{0,4})?$"
+
+  S3LifecycleKeepNewerVersions:
+    Description: >-
+      How many of the most recent noncurrent versions of an object are kept even
+      when they are older than S3LifecycleNoncurrentDays (1 to 100). Empty keeps none
+      beyond that age. Only read when S3LifecycleNoncurrentDays is set.
+    Type: String
+    Default: ""
+    AllowedPattern: "^(100|[1-9][0-9]?)?$"
+
   # --- DYNAMODB CONFIGURATION ---
   CreateDynamoDBTable:
     Description: "Do you want to create the DynamoDB table for State Locking? (true/false)."
@@ -119,6 +137,8 @@ Parameters:
 Conditions:
   ShouldCreateS3: !Equals [ !Ref CreateS3Bucket, "true" ]
   HasS3BucketName: !Not [ !Equals [ !Ref S3BucketName, "" ] ]
+  HasNoncurrentLifecycle: !Not [ !Equals [ !Ref S3LifecycleNoncurrentDays, "" ] ]
+  HasKeepNewerVersions: !Not [ !Equals [ !Ref S3LifecycleKeepNewerVersions, "" ] ]
   ShouldCreateDynamoDB: !Equals [ !Ref CreateDynamoDBTable, "true" ]
   ShouldCreateOIDC: !Equals [ !Ref CreateOIDCProvider, "true" ]
   ShouldRequireEngineWorkflow: !Equals [ !Ref RequireEngineWorkflow, "true" ]
@@ -165,6 +185,18 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      LifecycleConfiguration: !If
+        - HasNoncurrentLifecycle
+        - Rules:
+            - Id: expire-noncurrent-versions
+              Status: Enabled
+              NoncurrentVersionExpiration:
+                NoncurrentDays: !Ref S3LifecycleNoncurrentDays
+                NewerNoncurrentVersions: !If
+                  - HasKeepNewerVersions
+                  - !Ref S3LifecycleKeepNewerVersions
+                  - !Ref "AWS::NoValue"
+        - !Ref "AWS::NoValue"
       Tags:
         - Key: Name
           Value: !Ref S3BucketName
